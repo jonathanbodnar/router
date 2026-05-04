@@ -32,11 +32,14 @@ const cleanEnv = () => {
 
 // --------------- classifyEffort ---------------
 
-console.log("\n=== classifyEffort: agentic tier — low effort (non-agent mode) ===\n");
+console.log("\n=== classifyEffort: agentic tier (MiMo) — always low ===\n");
+// MiMo is capped at low because Cursor has a ~5s first-content-token
+// timeout. Medium/high reasoning causes MiMo to think for 10-20+ seconds,
+// triggering infinite retry storms. Tasks needing deep thinking should
+// route to Sonnet/Opus instead.
 
 cleanEnv();
 {
-  // Short tool-calling continuation with few tools (not full agent mode)
   expect(
     "short msg + few tools = low",
     classifyEffort("here is the file content", 3, "agentic") === "low",
@@ -50,217 +53,32 @@ cleanEnv();
 }
 {
   expect(
-    "rename a variable = low",
-    classifyEffort("rename getUserData to fetchUserProfile", 2, "agentic") === "low",
+    "bug fix description = low (capped for Cursor compat)",
+    classifyEffort("debug the login form race condition in useEffect cleanup", 5, "agentic") === "low",
   );
 }
 {
   expect(
-    "fix an import = low",
-    classifyEffort("fix the import for React", 3, "agentic") === "low",
+    "build new feature = low (capped for Cursor compat)",
+    classifyEffort("build a new settings page with dark mode toggle", 5, "agentic") === "low",
   );
 }
 {
   expect(
-    "add a comment = low",
-    classifyEffort("add a comment explaining this function", 2, "agentic") === "low",
+    "agent mode: short turn = low",
+    classifyEffort("here is the file content", 19, "agentic") === "low",
   );
 }
 {
   expect(
-    "typo fix = low",
-    classifyEffort("fix the typo in the error message", 4, "agentic") === "low",
+    "agent mode: build signal = low (capped)",
+    classifyEffort("build a new REST endpoint for user preferences", 19, "agentic") === "low",
   );
 }
 {
   expect(
-    "what is this = low",
-    classifyEffort("what is this function doing?", 2, "agentic") === "low",
-  );
-}
-{
-  expect(
-    "where is the config = low",
-    classifyEffort("where is the database config?", 3, "agentic") === "low",
-  );
-}
-{
-  expect(
-    "show me all routes = low",
-    classifyEffort("show me all the API routes", 2, "agentic") === "low",
-  );
-}
-{
-  // Very short, no keywords, few tools = low
-  expect(
-    "4-word msg + few tools = low",
-    classifyEffort("ok do it", 3, "agentic") === "low",
-  );
-}
-{
-  expect(
-    "update padding = low",
-    classifyEffort("update the padding on the card to 16px", 2, "agentic") === "low",
-  );
-}
-{
-  expect(
-    "eslint fix = low",
-    classifyEffort("run eslint and fix the warnings", 2, "agentic") === "low",
-  );
-}
-
-console.log("\n=== classifyEffort: agentic tier — medium effort ===\n");
-
-{
-  const msg =
-    "the login form is showing a flash of unstyled content after submitting, " +
-    "can you debug this and figure out why the state reset is happening " +
-    "before the redirect completes? I think it might be a race condition " +
-    "in the useEffect cleanup.";
-  expect(
-    "bug fix description (medium-length) = medium",
-    classifyEffort(msg, 5, "agentic") === "medium",
-    `tokens≈${Math.ceil(msg.length / 4)}`,
-  );
-}
-{
-  const msg =
-    "update the API response handler to properly parse the new pagination " +
-    "format. Right now it expects a flat array but the backend now returns " +
-    "an object with data and metadata fields.";
-  expect(
-    "API handler update = medium",
-    classifyEffort(msg, 4, "agentic") === "medium",
-    `tokens≈${Math.ceil(msg.length / 4)}`,
-  );
-}
-{
-  const msg = "a ".repeat(45) + "please fix the form validation logic here";
-  expect(
-    "generic medium-length dev request = medium",
-    classifyEffort(msg, 3, "agentic") === "medium",
-    `tokens≈${Math.ceil(msg.length / 4)}`,
-  );
-}
-
-console.log("\n=== classifyEffort: agentic tier — high effort ===\n");
-
-{
-  expect(
-    "build a new component = high",
-    classifyEffort("build a new settings page with dark mode toggle", 5, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "create a new API endpoint = high",
-    classifyEffort("create a new REST endpoint for user preferences", 4, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "implement new feature = high",
-    classifyEffort("implement a new notification system with real-time updates", 5, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "integrate third-party service = high",
-    classifyEffort("integrate Stripe payment processing into the checkout flow", 3, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "new feature keyword = high",
-    classifyEffort("add a new feature for bulk user import via CSV", 4, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "from scratch = high",
-    classifyEffort("write the auth middleware from scratch", 2, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "scaffold = high",
-    classifyEffort("scaffold the project structure for the new microservice", 3, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "end-to-end = high",
-    classifyEffort("wire up the end-to-end flow from form submission to email confirmation", 5, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "don't break existing = high",
-    classifyEffort("refactor the data layer but don't break the existing API contracts", 4, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "large refactor = high",
-    classifyEffort("do a large refactor of the state management layer", 3, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "migration = high",
-    classifyEffort("migrate the database schema to support multi-tenancy", 2, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "multi-file work = high",
-    classifyEffort("this is a multi-file change across the frontend and backend", 5, "agentic") === "high",
-  );
-}
-
-console.log("\n=== classifyEffort: agent mode floor (tools >= 10) ===\n");
-
-{
-  // Full Cursor agent mode — even a short tool result gets medium floor
-  expect(
-    "agent mode: short msg = medium (not low)",
-    classifyEffort("here is the file content", 19, "agentic") === "medium",
-  );
-}
-{
-  // CSS keyword in agent mode — would be low in non-agent, but floor is medium
-  expect(
-    "agent mode: CSS mention = medium (floor applies)",
-    classifyEffort("change the background color to blue", 19, "agentic") === "medium",
-  );
-}
-{
-  // Very short agent turn (tool result continuation)
-  expect(
-    "agent mode: 3-word msg = medium (floor)",
-    classifyEffort("ok do it", 15, "agentic") === "medium",
-  );
-}
-{
-  // HIGH signal still wins in agent mode — gets upgraded to high
-  expect(
-    "agent mode: build signal = high (overrides floor)",
-    classifyEffort("build a new settings page with dark mode toggle", 19, "agentic") === "high",
-  );
-}
-{
-  // HIGH signal in agent mode
-  expect(
-    "agent mode: create new endpoint = high",
-    classifyEffort("create a new REST endpoint for user preferences", 19, "agentic") === "high",
-  );
-}
-{
-  // Typical Cursor agent mid-task turn (reading files, making edits)
-  expect(
-    "agent mode: generic short turn = medium",
-    classifyEffort("Now I'll update ShowKPIPage.tsx", 19, "agentic") === "medium",
+    "agent mode: generic mid-task = low",
+    classifyEffort("Now I'll update ShowKPIPage.tsx", 19, "agentic") === "low",
   );
 }
 
@@ -294,24 +112,12 @@ cleanEnv();
   const out = withReasoningEffort(
     { model: "xiaomi/mimo-v2.5-pro" },
     "xiaomi/mimo-v2.5-pro",
-    "medium",
-  ) as { reasoning?: { effort?: string } };
+    "low",
+  ) as { reasoning?: { effort?: string; max_tokens?: number } };
   expect(
-    "MiMo gets dynamic medium effort",
-    out.reasoning?.effort === "medium",
-    `effort=${out.reasoning?.effort}`,
-  );
-}
-{
-  const out = withReasoningEffort(
-    { model: "xiaomi/mimo-v2.5-pro" },
-    "xiaomi/mimo-v2.5-pro",
-    "high",
-  ) as { reasoning?: { effort?: string } };
-  expect(
-    "MiMo gets dynamic high effort",
-    out.reasoning?.effort === "high",
-    `effort=${out.reasoning?.effort}`,
+    "MiMo gets low effort + max_tokens cap",
+    out.reasoning?.effort === "low" && out.reasoning?.max_tokens === 128,
+    `reasoning=${JSON.stringify(out.reasoning)}`,
   );
 }
 {
@@ -334,7 +140,7 @@ cleanEnv();
     "low",
   ) as { reasoning?: { effort?: string; max_tokens?: number } };
   expect(
-    "client-set reasoning preserved even when dynamic=low",
+    "client-set reasoning preserved (never overwritten)",
     out.reasoning?.effort === "high" && out.reasoning?.max_tokens === 4096,
     `reasoning=${JSON.stringify(out.reasoning)}`,
   );
@@ -344,11 +150,11 @@ cleanEnv();
     { model: "anthropic/claude-opus-4.7" },
     "anthropic/claude-opus-4.7",
     null,
-  ) as { reasoning?: { effort?: string } };
+  ) as { reasoning?: { effort?: string; max_tokens?: number } };
   expect(
-    "Opus falls back to static default (high)",
-    out.reasoning?.effort === "high",
-    `effort=${out.reasoning?.effort}`,
+    "Opus gets high effort, no max_tokens cap",
+    out.reasoning?.effort === "high" && !out.reasoning?.max_tokens,
+    `reasoning=${JSON.stringify(out.reasoning)}`,
   );
 }
 
@@ -358,11 +164,11 @@ cleanEnv();
 process.env.ROUTER_REASONING_EFFORT = "medium";
 {
   const out = withReasoningEffort({}, "xiaomi/mimo-v2.5-pro", "low") as
-    & { reasoning?: { effort?: string } };
+    & { reasoning?: { effort?: string; max_tokens?: number } };
   expect(
-    "env=medium overrides dynamic low",
-    out.reasoning?.effort === "medium",
-    `effort=${out.reasoning?.effort}`,
+    "env=medium overrides dynamic + keeps max_tokens cap",
+    out.reasoning?.effort === "medium" && out.reasoning?.max_tokens === 128,
+    `reasoning=${JSON.stringify(out.reasoning)}`,
   );
 }
 {
@@ -377,12 +183,12 @@ process.env.ROUTER_REASONING_EFFORT = "medium";
 cleanEnv();
 process.env.ROUTER_REASONING_EFFORT = "garbage";
 {
-  const out = withReasoningEffort({}, "xiaomi/mimo-v2.5-pro", "medium") as
-    & { reasoning?: { effort?: string } };
+  const out = withReasoningEffort({}, "xiaomi/mimo-v2.5-pro", "low") as
+    & { reasoning?: { effort?: string; max_tokens?: number } };
   expect(
-    "invalid env falls back to dynamic effort",
-    out.reasoning?.effort === "medium",
-    `effort=${out.reasoning?.effort}`,
+    "invalid env falls back to dynamic effort + cap",
+    out.reasoning?.effort === "low" && out.reasoning?.max_tokens === 128,
+    `reasoning=${JSON.stringify(out.reasoning)}`,
   );
 }
 
