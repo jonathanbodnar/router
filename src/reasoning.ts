@@ -49,17 +49,6 @@ export const REASONING_EFFORT_DEFAULTS: Record<string, ReasoningEffort> = {
   "anthropic/claude-opus-4.7": "high",
 };
 
-/**
- * Max reasoning tokens per model. Cursor presents our router as
- * "gpt-4.1" — a non-reasoning model — so it expects content within
- * ~3 seconds. MiMo's reasoning phase must finish before that timeout.
- * 64 tokens ≈ 1-2 sentences of thinking ≈ <1 second at MiMo's speed.
- */
-const REASONING_MAX_TOKENS: Record<string, number> = {
-  "xiaomi/mimo-v2.5-pro": 64,
-};
-
-
 /* ------------------------------------------------------------------ */
 /*  Dynamic effort classification                                     */
 /* ------------------------------------------------------------------ */
@@ -200,10 +189,7 @@ export function withReasoningEffort<B extends { reasoning?: unknown }>(
   if (!resolved) return body;
   if (!REASONING_CAPABLE_MODELS.has(model)) return body;
 
-  const cap = REASONING_MAX_TOKENS[model];
-  return cap
-    ? { ...body, reasoning: { effort: resolved, max_tokens: cap } }
-    : { ...body, reasoning: { effort: resolved } };
+  return { ...body, reasoning: { effort: resolved } };
 }
 
 /* ------------------------------------------------------------------ */

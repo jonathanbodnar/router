@@ -134,8 +134,8 @@ cleanEnv();
     "low",
   ) as { reasoning?: { effort?: string; max_tokens?: number } };
   expect(
-    "MiMo gets low effort + max_tokens cap",
-    out.reasoning?.effort === "low" && out.reasoning?.max_tokens === 64,
+    "MiMo gets low effort (no max_tokens — not all providers support it)",
+    out.reasoning?.effort === "low" && !("max_tokens" in (out.reasoning ?? {})),
     `reasoning=${JSON.stringify(out.reasoning)}`,
   );
 }
