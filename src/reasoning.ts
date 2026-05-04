@@ -143,14 +143,21 @@ export function classifyEffort(
   // HIGH signals always win, regardless of message length.
   if (isHighSignal) return "high";
 
-  // Very short user message + tools present = tool-call continuation
-  // (read file, run command, etc.) — no thinking needed.
-  if (userTokens < 30 && toolCount > 0) return "low";
+  // Full agent mode (Cursor sends ~19 tools). In a multi-turn agent
+  // conversation the "last user message" is often a tool result, not
+  // the original task request. We can't reliably classify individual
+  // turns, so floor the effort at medium for agent mode — it's always
+  // substantive work even if a single turn looks trivial.
+  const isAgentMode = toolCount >= 10;
+  const floor: ReasoningEffort = isAgentMode ? "medium" : "low";
 
-  // Trivial / mechanical signals, but only for short messages.
-  // Longer messages that happen to mention "css" might have more
-  // going on, so we don't auto-low them.
-  if (LOW_RE.test(userText) && userTokens < 150) return "low";
+  // Very short user message + few tools = simple tool-call relay or
+  // inline question — no thinking needed.
+  if (!isAgentMode && userTokens < 30 && toolCount > 0) return "low";
+
+  // Trivial / mechanical signals, but only for short messages and not
+  // in full agent mode.
+  if (!isAgentMode && LOW_RE.test(userText) && userTokens < 150) return "low";
 
   // Longer user messages with no strong keyword signal are likely
   // moderate dev work — bug fixes, small feature adjustments, edits.
@@ -160,8 +167,8 @@ export function classifyEffort(
   // there's enough content to suggest a real task.
   if (userTokens > 30) return "medium";
 
-  // Very short, no keywords = low.
-  return "low";
+  // Fall back to the floor (medium in agent mode, low otherwise).
+  return floor;
 }
 
 /* ------------------------------------------------------------------ */

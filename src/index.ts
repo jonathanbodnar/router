@@ -794,6 +794,26 @@ app.post("/v1/chat/completions", async (c) => {
  * delta text + tool-call arguments into `captured.responseText` for the
  * async quality judge.
  */
+/**
+ * After stripping reasoning fields, check if a choice is now empty —
+ * i.e. delta has only content:"" and/or role, with no tool_calls and
+ * no finish_reason. These are reasoning-only heartbeat chunks that
+ * would show up as dead air in Cursor.
+ */
+function isEmptyDelta(
+  choice: { delta?: Record<string, unknown>; finish_reason?: unknown } | null,
+): boolean {
+  if (!choice) return true;
+  if (choice.finish_reason) return false;
+  const d = choice.delta;
+  if (!d) return true;
+  if (d.tool_calls) return false;
+  const c = d.content;
+  if (typeof c === "string" && c.length > 0) return false;
+  if (d.function_call) return false;
+  return true;
+}
+
 function rewriteSseEvent(
   rawEvent: string,
   requestedModel: string,
@@ -846,6 +866,14 @@ function rewriteSseEvent(
                     }
                   }
                 }
+              }
+              // After stripping reasoning, if the delta is now just
+              // { content: "", role: "..." } with no tool_calls and no
+              // finish_reason, it's a reasoning-only chunk. Drop it so
+              // Cursor doesn't see a stream of empty events that make
+              // it think the response is stalled.
+              if (mutated && isEmptyDelta(choice)) {
+                return "";
               }
             }
           }
