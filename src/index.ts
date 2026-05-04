@@ -285,16 +285,35 @@ app.post("/v1/chat/completions", async (c) => {
     );
   }
 
-  let upstreamBody: IncomingRequest = { ...body, model: decision.model };
-  if (provider.injectUsageInclude) {
-    upstreamBody = withUsageIncluded(upstreamBody);
-  }
-
-  const upstreamHeaders: Record<string, string> = {
-    "content-type": "application/json",
-    authorization: `Bearer ${provider.apiKey}`,
-    ...provider.extraHeaders,
+  /**
+   * Build the request to send upstream for a given (provider, model) pair.
+   */
+  const buildUpstreamRequest = (
+    p: typeof provider,
+    model: string,
+  ): { url: string; init: RequestInit } => {
+    let payload: IncomingRequest = { ...body, model };
+    if (p.injectUsageInclude) payload = withUsageIncluded(payload);
+    return {
+      url: `${p.baseUrl}/chat/completions`,
+      init: {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${p.apiKey}`,
+          ...p.extraHeaders,
+        },
+        body: JSON.stringify(payload),
+      },
+    };
   };
+
+  // Mutable "what we actually called" so logging + DB record reflect the
+  // final model, not just the original routing decision.
+  let actualProvider = provider;
+  let actualModel = decision.model;
+  let actualTier = decision.tier;
+  let fellBackTo: string | null = null;
 
   const usage = emptyUsage();
 
@@ -304,8 +323,8 @@ app.post("/v1/chat/completions", async (c) => {
       recordCall({
         ts: Math.floor(startedAt / 1000),
         requested_model: requestedModel,
-        routed_model: decision.model,
-        tier: decision.tier,
+        routed_model: actualModel,
+        tier: actualTier,
         project,
         work_type: workType,
         prompt_tokens: usage.prompt_tokens,
@@ -322,15 +341,57 @@ app.post("/v1/chat/completions", async (c) => {
     }
   };
 
+  /**
+   * Try the routed (provider, model). If upstream returns a non-OK status
+   * AND we weren't already on the code tier (Sonnet), retry once on
+   * Sonnet — it's the most reliable target for OpenAI-shaped tool calls.
+   * Returns the (final) Response, with body never consumed.
+   */
+  const callUpstreamWithFallback = async (): Promise<Response> => {
+    const primary = buildUpstreamRequest(provider, decision.model);
+    let resp: Response;
+    try {
+      resp = await fetch(primary.url, primary.init);
+    } catch (err) {
+      console.error(`[upstream:${provider.name}] fetch failed:`, err);
+      throw err;
+    }
+    // Don't retry the code tier itself, and don't retry on success.
+    if (resp.ok || decision.tier === "code") return resp;
+
+    // Snapshot the upstream error body for the logs, then retry on Sonnet.
+    let primaryBody = "";
+    try { primaryBody = await resp.text(); } catch { /* ignore */ }
+    console.warn(
+      `[fallback] ${provider.name}:${decision.model} -> ${resp.status} ` +
+        `body=${primaryBody.slice(0, 400)} ; retrying on code tier (Sonnet)`,
+    );
+    const fallbackEntry = MODELS.code;
+    const fallbackProvider = PROVIDERS[fallbackEntry.provider];
+    const fallback = buildUpstreamRequest(fallbackProvider, fallbackEntry.model);
+    let fallbackResp: Response;
+    try {
+      fallbackResp = await fetch(fallback.url, fallback.init);
+    } catch (err) {
+      console.error(`[upstream:${fallbackProvider.name}] fallback fetch failed:`, err);
+      // Re-throw the original surface for the client.
+      return new Response(primaryBody, { status: resp.status, headers: resp.headers });
+    }
+    if (fallbackResp.ok) {
+      actualProvider = fallbackProvider;
+      actualModel = fallbackEntry.model;
+      actualTier = "code";
+      fellBackTo = `${fallbackProvider.name}:${fallbackEntry.model}`;
+      return fallbackResp;
+    }
+    // Both failed; surface the fallback's error since it's the more recent.
+    return fallbackResp;
+  };
+
   let upstream: Response;
   try {
-    upstream = await fetch(`${provider.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: upstreamHeaders,
-      body: JSON.stringify(upstreamBody),
-    });
+    upstream = await callUpstreamWithFallback();
   } catch (err) {
-    console.error(`[upstream:${provider.name}] fetch failed:`, err);
     finalize(502, String(err));
     return c.json(
       {
@@ -343,13 +404,17 @@ app.post("/v1/chat/completions", async (c) => {
     );
   }
 
+  if (log && fellBackTo) {
+    console.log(`[fallback-ok] served via ${fellBackTo}`);
+  }
+
   /* ---------- non-streaming ---------- */
 
   if (!isStream) {
     const text = await upstream.text();
     if (!upstream.ok) {
       console.error(
-        `[upstream:${provider.name}] ${upstream.status} body=${text.slice(0, 800)}`,
+        `[upstream:${actualProvider.name}] ${upstream.status} body=${text.slice(0, 800)}`,
       );
       finalize(upstream.status, text.slice(0, 500));
       return new Response(text, {
@@ -364,15 +429,16 @@ app.post("/v1/chat/completions", async (c) => {
       const json = JSON.parse(text);
       if (json && typeof json === "object") {
         if (json.usage) mergeUsage(usage, json.usage);
-        finalizeCost(decision.provider, decision.model, usage);
+        finalizeCost(actualProvider.name, actualModel, usage);
         json.model = requestedModel;
         if (!json._router) {
           json._router = {
             requested: requestedModel,
-            provider: decision.provider,
-            routed_to: decision.model,
-            tier: decision.tier,
+            provider: actualProvider.name,
+            routed_to: actualModel,
+            tier: actualTier,
             reason: decision.reason,
+            fell_back: fellBackTo,
             project,
             work_type: workType,
           };
@@ -381,7 +447,7 @@ app.post("/v1/chat/completions", async (c) => {
       finalize(upstream.status, null);
       return c.json(json, upstream.status as 200);
     } catch {
-      finalizeCost(decision.provider, decision.model, usage);
+      finalizeCost(actualProvider.name, actualModel, usage);
       finalize(upstream.status, "non-json upstream response");
       return new Response(text, {
         status: upstream.status,
@@ -395,7 +461,7 @@ app.post("/v1/chat/completions", async (c) => {
   if (!upstream.ok || !upstream.body) {
     const text = await upstream.text();
     console.error(
-      `[upstream:${provider.name}] ${upstream.status} (stream) body=${text.slice(0, 800)}`,
+      `[upstream:${actualProvider.name}] ${upstream.status} (stream) body=${text.slice(0, 800)}`,
     );
     finalize(upstream.status, text.slice(0, 500));
     return new Response(text || "Upstream error", {
@@ -445,7 +511,7 @@ app.post("/v1/chat/completions", async (c) => {
           const rewritten = rewriteSseEvent(buffer, requestedModel, usage);
           controller.enqueue(encoder.encode(rewritten));
         }
-        finalizeCost(decision.provider, decision.model, usage);
+        finalizeCost(actualProvider.name, actualModel, usage);
         recordOnce(200, null);
       } catch (err) {
         console.error("[stream] error:", err);

@@ -45,7 +45,7 @@ const cases: Case[] = [
     req: { model: "auto", messages: [{ role: "user", content:
       "I'm doing a complex refactor of our distributed system architecture. " +
       "Deeply analyze the trade-offs between event sourcing and CRUD for our billing service. " +
-      "Context: ".padEnd(8000, "x") }] } },
+      "Context: ".padEnd(28000, "x") }] } },
 
   // --- aliases / passthrough ---
   { name: "alias: easy",   expect: "agentic",  req: { model: "easy",   messages: [{ role: "user", content: "hi" }] } },

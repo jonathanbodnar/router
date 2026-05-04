@@ -135,11 +135,13 @@ const DEV_TASK_RE =
   /\b(debug|fix (?:this|the|a) bug|stack ?trace|error|implement|refactor|unit ?test|integration ?test|code review|lint|type ?error|compile|build fail|regex|api endpoint|edit (?:this|the) file|write (?:a )?(?:function|component|hook|module|script))\b/i;
 
 const REASONING_RE =
-  /\b(architect(?:ure)?|system design|design system|design doc|trade ?off|complex refactor|large refactor|migrate|migration plan|critical|production[- ]grade|mission[- ]critical|deeply analyze|prove|formal|invariant|consistency model|distributed system|threat model|security review|reason step ?by ?step|chain[- ]of[- ]thought|hard problem|highest stakes)\b/i;
+  /\b(system design|design doc|architectural (?:decision|choice|trade ?off)|complex refactor|large refactor|migration plan|production[- ]grade|mission[- ]critical|deeply analyze|formal proof|invariant|consistency model|distributed system|threat model|security audit|step ?by ?step reasoning|chain[- ]of[- ]thought|hard problem|highest stakes|why is this (?:the )?(?:correct|right) (?:approach|design)|prove that)\b/i;
 
 /** Heuristic token thresholds, tuned for Cursor-style traffic. */
 const LONG_CONTEXT_TOKENS = 32_000; // bulk-doc threshold for MiMo when no tools
-const REASONING_MIN_TOKENS = 1_500; // need some substance before we go to opus
+const REASONING_MIN_TOKENS = 6_000; // big bump: Cursor's stock system prompts
+//                                  // routinely cross 1.5k. Require real
+//                                  // substance before paying Opus prices.
 const MODERATE_CODE_TOKENS = 5_000; // above this, code work goes to Sonnet not MiMo
 const CODE_MIN_TOKENS = 200;
 
