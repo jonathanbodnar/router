@@ -82,6 +82,14 @@ const cases: Case[] = [
     req: { model: "auto",
       tools: [{ type: "function", function: { name: "search", parameters: {} } }],
       messages: [{ role: "user", content: "find recent issues about auth" }] } },
+  { name: "ack + action verb = agentic", expect: "agentic",
+    req: { model: "gpt-4.1",
+      tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
+      messages: [{ role: "user", content: "ok, now fix the loading issue" }] } },
+  { name: "thanks + check request = agentic", expect: "agentic",
+    req: { model: "gpt-4.1",
+      tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
+      messages: [{ role: "user", content: "thanks, can you also check why it's slow?" }] } },
 
   // --- aliases / passthrough ---
   { name: "alias: easy",   expect: "agentic",  req: { model: "easy",   messages: [{ role: "user", content: "hi" }] } },

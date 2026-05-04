@@ -162,11 +162,12 @@ const DEV_TASK_RE =
 /**
  * Positive signals that a message is conversational / confirmatory and
  * doesn't need an expensive model — even if Cursor attached 19 tools.
- * Must be combined with the absence of code signals + short length.
+ * Must be combined with the absence of code signals + short length +
+ * no action verbs (see ACTION_RE below).
  */
 const CONVERSATIONAL_RE = new RegExp(
   [
-    // acknowledgements / reactions
+    // acknowledgements / reactions (start of message)
     "^\\s*(?:thanks|thank you|thx|ty|ok(?:ay)?|yes|no|yep|yup|nope|sure|got it|noted|ack|confirmed?|roger|perfect|great|awesome|nice|cool|lgtm|looks? good|exactly|right|correct|that'?s? (?:right|correct|it)|good job|well done)",
     // status reports
     "\\bstill (?:show|shows|showing|only|not|doesn'?t|isn'?t|broken|wrong)\\b",
@@ -174,12 +175,23 @@ const CONVERSATIONAL_RE = new RegExp(
     "\\bthat (?:works?|worked|fixed|broke|didn'?t)",
     "\\bit(?:'?s| is) (?:working|fixed|broken|still|correct|wrong|the same)",
     "\\bnow (?:it |this |the )?(?:works?|shows?|looks?|loads?)",
-    // simple yes/no questions about state
-    "\\b(?:is|are|does|did|was|were) (?:it|this|that|the) ",
     // approval / closure
     "\\bship it\\b",
     "\\bmerge it\\b",
     "\\blooks? (?:good|great|fine|correct|right)\\b",
+  ].join("|"),
+  "i",
+);
+
+/**
+ * Action verbs that indicate the user wants the agent to DO something.
+ * If present alongside a conversational pattern, the message is NOT
+ * conversational — e.g. "ok, now fix the loading issue" starts with
+ * "ok" but "fix" means it's an action request.
+ */
+const ACTION_RE = new RegExp(
+  [
+    "\\b(?:fix|check|update|change|add|remove|delete|create|build|make|set|move|rename|refactor|implement|write|edit|modify|replace|install|run|execute|deploy|test|scan|search|find|look (?:at|into)|figure out|debug|investigate|analyze|review|optimize|improve|clean ?up|revert|undo|redo|push|pull|merge|commit|ship|try|handle|resolve|address|tackle|work on|help (?:me |with ))\\b",
   ].join("|"),
   "i",
 );
@@ -328,12 +340,16 @@ function classify(req: IncomingRequest): RouteDecision {
   }
 
   // 4a. Short conversational/confirmatory message + tools but NO code
-  //     signals -> cheap. Cursor always sends ~19 tools even for "thanks"
-  //     or "looks good". Requires BOTH a conversational pattern match AND
-  //     a short message to avoid false positives on action requests like
-  //     "find recent issues about auth".
+  //     signals AND no action verbs -> cheap. Cursor always sends ~19
+  //     tools even for "thanks" or "looks good". Requires ALL of:
+  //       - conversational pattern match (ack, status report, etc.)
+  //       - short message (< CONVERSATIONAL_MAX_TOKENS)
+  //       - no code signals (no fences, file paths, dev verbs)
+  //       - no action verbs ("fix", "check", "update", etc.)
+  //     This prevents "ok, now fix the loading issue" from going cheap.
   const looksConversational = CONVERSATIONAL_RE.test(userText);
-  if (!codeSignal && tools > 0 && looksConversational && userTokens < CONVERSATIONAL_MAX_TOKENS) {
+  const hasActionVerb = ACTION_RE.test(userText);
+  if (!codeSignal && !hasActionVerb && tools > 0 && looksConversational && userTokens < CONVERSATIONAL_MAX_TOKENS) {
     return decide(
       "cheap",
       `conversational (no code signal, ~${userTokens} user tok, tools=${tools})`,
