@@ -286,7 +286,32 @@ app.post("/v1/chat/completions", async (c) => {
   }
 
   /**
+   * Headers we NEVER forward from the client to upstream — anything that
+   * would either be wrong (Host, Content-Length), a duplicate of what we
+   * set ourselves (Authorization, Content-Type), a transport concern
+   * (Connection, Transfer-Encoding, Accept-Encoding), or part of our own
+   * namespace (X-Router-*).
+   */
+  const STRIPPED = new Set([
+    "authorization",
+    "host",
+    "content-length",
+    "content-type",
+    "cookie",
+    "set-cookie",
+    "connection",
+    "transfer-encoding",
+    "accept-encoding",
+  ]);
+
+  /**
    * Build the request to send upstream for a given (provider, model) pair.
+   * We deliberately forward most client headers (User-Agent, OpenAI-Beta,
+   * X-Stainless-*, etc.) so upstream can apply the same client-aware
+   * compatibility behaviour it does when the client talks to it directly
+   * — without those headers, e.g. OpenRouter's adapter for Xiaomi/MiMo
+   * doesn't translate OpenAI-shaped tool definitions, and Xiaomi rejects
+   * the request with "Param Incorrect, param: function is not set".
    */
   const buildUpstreamRequest = (
     p: typeof provider,
@@ -294,15 +319,24 @@ app.post("/v1/chat/completions", async (c) => {
   ): { url: string; init: RequestInit } => {
     let payload: IncomingRequest = { ...body, model };
     if (p.injectUsageInclude) payload = withUsageIncluded(payload);
+
+    const headers: Record<string, string> = {};
+    c.req.raw.headers.forEach((value, name) => {
+      const lower = name.toLowerCase();
+      if (STRIPPED.has(lower)) return;
+      if (lower.startsWith("x-router-")) return;
+      headers[name] = value;
+    });
+    // Our overrides go last so they win over anything the client sent.
+    headers["content-type"] = "application/json";
+    headers["authorization"] = `Bearer ${p.apiKey}`;
+    for (const [k, v] of Object.entries(p.extraHeaders)) headers[k] = v;
+
     return {
       url: `${p.baseUrl}/chat/completions`,
       init: {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${p.apiKey}`,
-          ...p.extraHeaders,
-        },
+        headers,
         body: JSON.stringify(payload),
       },
     };

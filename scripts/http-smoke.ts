@@ -145,15 +145,15 @@ async function call(opts: {
   }
 }
 
-// 1. code tier (OpenRouter, non-streaming) — cost should come from usage.cost
-await call({ stream: false, project: "router",  work_type: "bug_fix",     msg: "fix the bug in src/db.ts where ts is wrong" });
-// 2. code tier (OpenRouter, streaming) — cost should come from final chunk
-await call({ stream: true,  project: "shopapp", work_type: "new_feature", msg: "build a new checkout page in src/Checkout.tsx" });
-// 3. cheap tier (Fireworks, explicit alias) — cost should be COMPUTED locally,
+// 1. code tier -> Sonnet (OpenRouter, non-streaming) — cost from usage.cost
+await call({ stream: false, project: "router",    work_type: "bug_fix",     model: "code",  msg: "fix the bug in src/db.ts where ts is wrong" });
+// 2. code tier -> Sonnet (OpenRouter, streaming) — cost from final chunk
+await call({ stream: true,  project: "shopapp",   work_type: "new_feature", model: "code",  msg: "build a new checkout page in src/Checkout.tsx" });
+// 3. cheap tier -> Fireworks (non-streaming) — cost COMPUTED locally,
 //    1000 in * $1/1M + 200 out * $2/1M = 0.0014 USD
-await call({ stream: false, project: "marketing", work_type: "other", model: "cheap", msg: "write a 3-bullet summary of why we should adopt PRs" });
-// 4. cheap tier (Fireworks, streaming)
-await call({ stream: true,  project: "marketing", work_type: "other", model: "cheap", msg: "write 5 alt taglines for our login page" });
+await call({ stream: false, project: "marketing", work_type: "other",       model: "cheap", msg: "write a 3-bullet summary of why we should adopt PRs" });
+// 4. cheap tier -> Fireworks (streaming)
+await call({ stream: true,  project: "marketing", work_type: "other",       model: "cheap", msg: "write 5 alt taglines for our login page" });
 
 /* ---------- dashboard ---------- */
 
