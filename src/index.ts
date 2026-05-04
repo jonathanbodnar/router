@@ -126,6 +126,74 @@ function withUsageIncluded(body: IncomingRequest): IncomingRequest {
 }
 
 /**
+ * Some clients (Cursor, OpenAI Responses-API consumers, etc.) post bodies
+ * that use `input` / `instructions` / `prompt` instead of `messages`. We
+ * normalise everything to a chat-completions-shaped body before forwarding,
+ * so upstream never has to deal with the variation.
+ *
+ * Returns the normalised body and a list of source-field names we adapted
+ * from (for logging).
+ */
+function normaliseBody(
+  body: Record<string, unknown>,
+): { body: Record<string, unknown>; adapted: string[] } {
+  const adapted: string[] = [];
+  const messagesPresent =
+    Array.isArray(body.messages) && (body.messages as unknown[]).length > 0;
+  if (messagesPresent) return { body, adapted };
+
+  const messages: Array<{ role: string; content: string }> = [];
+
+  // Responses API: top-level `instructions` becomes a system message.
+  if (typeof body.instructions === "string" && body.instructions.length > 0) {
+    messages.push({ role: "system", content: body.instructions });
+    adapted.push("instructions");
+  }
+  // Some clients use `system` directly.
+  if (typeof body.system === "string" && body.system.length > 0) {
+    messages.push({ role: "system", content: body.system });
+    adapted.push("system");
+  }
+
+  // Responses API: `input` may be a string or an array of typed parts.
+  if (typeof body.input === "string" && body.input.length > 0) {
+    messages.push({ role: "user", content: body.input });
+    adapted.push("input");
+  } else if (Array.isArray(body.input)) {
+    const text = (body.input as Array<Record<string, unknown>>)
+      .map((p) =>
+        typeof p?.text === "string"
+          ? p.text
+          : typeof p?.content === "string"
+            ? p.content
+            : "",
+      )
+      .filter(Boolean)
+      .join("\n");
+    if (text) {
+      messages.push({ role: "user", content: text });
+      adapted.push("input[]");
+    }
+  }
+
+  // Legacy completions: `prompt` is a plain string.
+  if (typeof body.prompt === "string" && body.prompt.length > 0) {
+    messages.push({ role: "user", content: body.prompt });
+    adapted.push("prompt");
+  }
+
+  if (messages.length > 0) {
+    const out: Record<string, unknown> = { ...body, messages };
+    delete out.input;
+    delete out.instructions;
+    delete out.system;
+    delete out.prompt;
+    return { body: out, adapted };
+  }
+  return { body, adapted };
+}
+
+/**
  * Compute cost for a finished call. For providers that return cost in
  * `usage.cost` (OpenRouter) we trust that number; otherwise we derive it
  * from the per-model price table in pricing.ts.
@@ -147,9 +215,9 @@ function finalizeCost(
 app.post("/v1/chat/completions", async (c) => {
   const startedAt = Date.now();
 
-  let body: IncomingRequest;
+  let rawBody: Record<string, unknown>;
   try {
-    body = await c.req.json();
+    rawBody = (await c.req.json()) as Record<string, unknown>;
   } catch {
     return c.json(
       {
@@ -161,6 +229,27 @@ app.post("/v1/chat/completions", async (c) => {
       400,
     );
   }
+
+  // Log the incoming body shape so we can see exactly what clients send
+  // (Cursor in particular has been seen to use Responses-API-style fields).
+  if (log) {
+    const keys = Object.keys(rawBody);
+    const msgs = Array.isArray(rawBody.messages)
+      ? (rawBody.messages as unknown[]).length
+      : "—";
+    console.log(
+      `[req] keys=[${keys.join(",")}] messages=${msgs} ` +
+        `has_input=${"input" in rawBody} has_prompt=${"prompt" in rawBody} ` +
+        `has_instructions=${"instructions" in rawBody}`,
+    );
+  }
+
+  const { body: normalisedBody, adapted } = normaliseBody(rawBody);
+  if (log && adapted.length > 0) {
+    console.log(`[normalise] adapted fields: ${adapted.join(", ")} -> messages`);
+  }
+
+  const body = normalisedBody as IncomingRequest;
 
   const decision = route(body);
   const provider = PROVIDERS[decision.provider];
@@ -240,6 +329,9 @@ app.post("/v1/chat/completions", async (c) => {
   if (!isStream) {
     const text = await upstream.text();
     if (!upstream.ok) {
+      console.error(
+        `[upstream:${provider.name}] ${upstream.status} body=${text.slice(0, 800)}`,
+      );
       finalize(upstream.status, text.slice(0, 500));
       return new Response(text, {
         status: upstream.status,
@@ -283,6 +375,9 @@ app.post("/v1/chat/completions", async (c) => {
 
   if (!upstream.ok || !upstream.body) {
     const text = await upstream.text();
+    console.error(
+      `[upstream:${provider.name}] ${upstream.status} (stream) body=${text.slice(0, 800)}`,
+    );
     finalize(upstream.status, text.slice(0, 500));
     return new Response(text || "Upstream error", {
       status: upstream.status,
