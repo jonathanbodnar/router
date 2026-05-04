@@ -16,6 +16,8 @@ import { normaliseBody } from "./normalise.js";
 import { computeCost } from "./pricing.js";
 import { loadProviders, type Provider } from "./providers.js";
 import {
+  classifyEffort,
+  type ReasoningEffort,
   shouldStripReasoning,
   stripReasoningInPlace,
   withReasoningEffort,
@@ -324,10 +326,21 @@ app.post("/v1/chat/completions", async (c) => {
   const workType = resolveWorkType(c.req.header("x-router-work-type"), body);
   const isStream = body.stream === true;
 
+  // Dynamic reasoning effort — adapts to task complexity so MiMo
+  // thinks hard on "build this feature" but barely pauses on "rename X".
+  const userTextForEffort = lastUserMessageText(body);
+  const toolCount = Array.isArray(body.tools) ? body.tools.length : 0;
+  const reasoningEffort: ReasoningEffort = classifyEffort(
+    userTextForEffort,
+    toolCount,
+    decision.tier,
+  );
+
   if (log) {
     console.log(
       `[route] requested="${requestedModel}" -> ${decision.provider}:${decision.model} ` +
         `(${decision.tier}; ${decision.reason}) ` +
+        `effort=${reasoningEffort} ` +
         `project=${project ?? "-"} work_type=${workType} stream=${isStream}`,
     );
   }
@@ -360,7 +373,7 @@ app.post("/v1/chat/completions", async (c) => {
   ): { url: string; init: RequestInit } => {
     let payload: IncomingRequest = { ...body, model };
     if (p.injectUsageInclude) payload = withUsageIncluded(payload);
-    payload = withReasoningEffort(payload, model);
+    payload = withReasoningEffort(payload, model, reasoningEffort);
 
     const headers: Record<string, string> = {};
     c.req.raw.headers.forEach((value, name) => {
@@ -661,6 +674,7 @@ app.post("/v1/chat/completions", async (c) => {
             provider: actualProvider.name,
             routed_to: actualModel,
             tier: actualTier,
+            reasoning_effort: reasoningEffort,
             reason: decision.reason,
             fell_back: fellBackTo,
             prompt_override: promptOverrideAlias,
