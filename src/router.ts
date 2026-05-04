@@ -2,24 +2,42 @@
  * Routing logic.
  *
  * The router maps an incoming OpenAI-style chat completion request to one of
- * four OpenRouter models, based either on:
+ * four backing models across two providers:
+ *
+ *   - cheap     -> Fireworks (DeepSeek V4 Pro)
+ *   - agentic   -> OpenRouter (Xiaomi MiMo V2.5 Pro)
+ *   - code      -> OpenRouter (Anthropic Claude Sonnet 4.6)
+ *   - reasoning -> OpenRouter (Anthropic Claude Opus 4.7)
+ *
+ * The dispatch is based on either:
  *
  *   1. An explicit alias the client passed as `model`
  *      (e.g. "auto", "cheap", "agentic", "code", "reasoning"), OR
  *   2. A heuristic classification of the request when `model` is "auto"
  *      (or the alias / model is unrecognised).
  *
- * Concrete OpenRouter model ids (anything containing a "/") are passed
- * through unchanged so power users can still pin a specific model.
+ * Concrete model ids (anything containing a "/") are passed through
+ * unchanged. Fireworks-style ids ("accounts/fireworks/...") route to
+ * Fireworks; everything else goes to OpenRouter.
  */
+
+import { detectProvider, type Provider } from "./providers.js";
 
 export type Tier = "cheap" | "agentic" | "code" | "reasoning";
 
-export const MODELS: Record<Tier, string> = {
-  cheap: "deepseek/deepseek-v4-pro",
-  agentic: "xiaomi/mimo-v2.5-pro",
-  code: "anthropic/claude-sonnet-4.6",
-  reasoning: "anthropic/claude-opus-4.7",
+export interface TierEntry {
+  provider: Provider;
+  model: string;
+}
+
+export const MODELS: Record<Tier, TierEntry> = {
+  cheap: {
+    provider: "fireworks",
+    model: "accounts/fireworks/models/deepseek-v4-pro",
+  },
+  agentic: { provider: "openrouter", model: "xiaomi/mimo-v2.5-pro" },
+  code: { provider: "openrouter", model: "anthropic/claude-sonnet-4.6" },
+  reasoning: { provider: "openrouter", model: "anthropic/claude-opus-4.7" },
 };
 
 /** Aliases the user can request directly as `model`. */
@@ -64,7 +82,8 @@ export interface IncomingRequest {
 
 export interface RouteDecision {
   tier: Tier;
-  model: string; // resolved OpenRouter model id
+  provider: Provider;
+  model: string; // resolved upstream model id
   reason: string;
   approxInputTokens: number;
 }
@@ -118,22 +137,23 @@ function classify(req: IncomingRequest): RouteDecision {
   const tools = Array.isArray(req.tools) ? req.tools.length : 0;
   const numMessages = req.messages?.length ?? 0;
 
+  const decide = (tier: Tier, reason: string): RouteDecision => ({
+    tier,
+    provider: MODELS[tier].provider,
+    model: MODELS[tier].model,
+    reason,
+    approxInputTokens: tokens,
+  });
+
   // 1. Long context or heavy tool-use agentic loops -> mimo.
   if (tokens >= LONG_CONTEXT_TOKENS) {
-    return {
-      tier: "agentic",
-      model: MODELS.agentic,
-      reason: `long context (~${tokens} tok)`,
-      approxInputTokens: tokens,
-    };
+    return decide("agentic", `long context (~${tokens} tok)`);
   }
   if (tools > 0 && (tokens >= 6_000 || numMessages >= 12)) {
-    return {
-      tier: "agentic",
-      model: MODELS.agentic,
-      reason: `tool-heavy agent loop (${tools} tools, ${numMessages} msgs, ~${tokens} tok)`,
-      approxInputTokens: tokens,
-    };
+    return decide(
+      "agentic",
+      `tool-heavy agent loop (${tools} tools, ${numMessages} msgs, ~${tokens} tok)`,
+    );
   }
 
   const hasCodeFence = CODE_FENCE_RE.test(text);
@@ -156,59 +176,48 @@ function classify(req: IncomingRequest): RouteDecision {
   //    Require both a reasoning signal AND meaningful substance, otherwise
   //    casual mentions of "architecture" don't blow the budget.
   if (looksReasoning && tokens >= REASONING_MIN_TOKENS) {
-    return {
-      tier: "reasoning",
-      model: MODELS.reasoning,
-      reason: `reasoning/architecture signal (~${tokens} tok)`,
-      approxInputTokens: tokens,
-    };
+    return decide(
+      "reasoning",
+      `reasoning/architecture signal (~${tokens} tok)`,
+    );
   }
 
   // 3. Code / dev work -> sonnet.
   if (strongCodeSignal) {
-    return {
-      tier: "code",
-      model: MODELS.code,
-      reason: `code/dev signal (~${tokens} tok, tools=${tools})`,
-      approxInputTokens: tokens,
-    };
+    return decide(
+      "code",
+      `code/dev signal (~${tokens} tok, tools=${tools})`,
+    );
   }
   if (weakCodeSignal && tokens >= CODE_MIN_TOKENS) {
-    return {
-      tier: "code",
-      model: MODELS.code,
-      reason: `code-ish prose (~${tokens} tok, tools=${tools})`,
-      approxInputTokens: tokens,
-    };
+    return decide(
+      "code",
+      `code-ish prose (~${tokens} tok, tools=${tools})`,
+    );
   }
   // Tools present at all is a strong "this is a dev/agent task" signal even
   // if the prompt itself is short.
   if (tools > 0) {
-    return {
-      tier: "code",
-      model: MODELS.code,
-      reason: `tool-calling request (${tools} tools, ~${tokens} tok)`,
-      approxInputTokens: tokens,
-    };
+    return decide(
+      "code",
+      `tool-calling request (${tools} tools, ~${tokens} tok)`,
+    );
   }
 
   // 4. Default: cheap general-purpose.
-  return {
-    tier: "cheap",
-    model: MODELS.cheap,
-    reason: `general/short prompt (~${tokens} tok)`,
-    approxInputTokens: tokens,
-  };
+  return decide("cheap", `general/short prompt (~${tokens} tok)`);
 }
 
-/** Resolve the client's `model` field to a concrete OpenRouter model id. */
+/** Resolve the client's `model` field to a concrete upstream model id. */
 export function route(req: IncomingRequest): RouteDecision {
   const requested = (req.model ?? "auto").trim();
 
-  // Passthrough for fully-qualified model ids ("vendor/model").
+  // Passthrough for fully-qualified model ids. Provider is inferred from
+  // the id ("accounts/fireworks/..." -> Fireworks; everything else -> OR).
   if (requested.includes("/")) {
     return {
       tier: "cheap",
+      provider: detectProvider(requested),
       model: requested,
       reason: `passthrough (${requested})`,
       approxInputTokens: approxTokens(fullText(req)),
@@ -222,7 +231,8 @@ export function route(req: IncomingRequest): RouteDecision {
     const tier = ALIASES[lower]!;
     return {
       tier,
-      model: MODELS[tier],
+      provider: MODELS[tier].provider,
+      model: MODELS[tier].model,
       reason: `alias "${lower}" -> ${tier}`,
       approxInputTokens: approxTokens(fullText(req)),
     };

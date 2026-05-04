@@ -4,27 +4,29 @@ import { cors } from "hono/cors";
 import { resolveProject, resolveWorkType } from "./classify.js";
 import { mountDashboard } from "./dashboard.js";
 import { recordCall } from "./db.js";
+import { computeCost } from "./pricing.js";
+import { loadProviders, type Provider } from "./providers.js";
 import { MODELS, route, type IncomingRequest } from "./router.js";
 
-const OPENROUTER_BASE =
-  process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api/v1";
+const { ROUTER_API_KEY, ROUTER_LOG, PORT } = process.env;
 
-const {
-  OPENROUTER_API_KEY,
-  ROUTER_API_KEY,
-  OPENROUTER_SITE_URL,
-  OPENROUTER_APP_TITLE,
-  ROUTER_LOG,
-  PORT,
-} = process.env;
-
-if (!OPENROUTER_API_KEY) {
-  console.error("FATAL: OPENROUTER_API_KEY is not set.");
-  process.exit(1);
-}
 if (!ROUTER_API_KEY) {
   console.error("FATAL: ROUTER_API_KEY is not set.");
   process.exit(1);
+}
+
+const PROVIDERS = loadProviders();
+
+// Validate API keys for the providers actually used by our tiers.
+const tiersInUse = new Set<Provider>(
+  Object.values(MODELS).map((t) => t.provider),
+);
+for (const p of tiersInUse) {
+  if (!PROVIDERS[p].apiKey) {
+    const envName = p === "openrouter" ? "OPENROUTER_API_KEY" : "FIREWORKS_API_KEY";
+    console.error(`FATAL: ${envName} is not set (required for ${p}).`);
+    process.exit(1);
+  }
 }
 
 const log = ROUTER_LOG === "1" || ROUTER_LOG === "true";
@@ -79,11 +81,11 @@ app.get("/v1/models", (c) => {
       created: now,
       owned_by: "router",
     })),
-    ...Object.values(MODELS).map((id) => ({
-      id,
+    ...Object.values(MODELS).map((t) => ({
+      id: t.model,
       object: "model",
       created: now,
-      owned_by: "openrouter",
+      owned_by: t.provider,
     })),
   ];
   return c.json({ object: "list", data });
@@ -123,6 +125,25 @@ function withUsageIncluded(body: IncomingRequest): IncomingRequest {
   return { ...body, usage: { ...existing, include: true } };
 }
 
+/**
+ * Compute cost for a finished call. For providers that return cost in
+ * `usage.cost` (OpenRouter) we trust that number; otherwise we derive it
+ * from the per-model price table in pricing.ts.
+ */
+function finalizeCost(
+  provider: Provider,
+  routedModel: string,
+  usage: CapturedUsage,
+): void {
+  if (PROVIDERS[provider].costFromUsage) return; // already set from upstream
+  if (usage.cost_usd > 0) return;
+  usage.cost_usd = computeCost(
+    routedModel,
+    usage.prompt_tokens,
+    usage.completion_tokens,
+  );
+}
+
 app.post("/v1/chat/completions", async (c) => {
   const startedAt = Date.now();
 
@@ -142,6 +163,7 @@ app.post("/v1/chat/completions", async (c) => {
   }
 
   const decision = route(body);
+  const provider = PROVIDERS[decision.provider];
   const requestedModel = (body.model ?? "auto").toString();
   const project = resolveProject(c.req.header("x-router-project"), body);
   const workType = resolveWorkType(c.req.header("x-router-work-type"), body);
@@ -149,20 +171,22 @@ app.post("/v1/chat/completions", async (c) => {
 
   if (log) {
     console.log(
-      `[route] requested="${requestedModel}" -> ${decision.model} ` +
+      `[route] requested="${requestedModel}" -> ${decision.provider}:${decision.model} ` +
         `(${decision.tier}; ${decision.reason}) ` +
         `project=${project ?? "-"} work_type=${workType} stream=${isStream}`,
     );
   }
 
-  const upstreamBody = withUsageIncluded({ ...body, model: decision.model });
+  let upstreamBody: IncomingRequest = { ...body, model: decision.model };
+  if (provider.injectUsageInclude) {
+    upstreamBody = withUsageIncluded(upstreamBody);
+  }
 
   const upstreamHeaders: Record<string, string> = {
     "content-type": "application/json",
-    authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    authorization: `Bearer ${provider.apiKey}`,
+    ...provider.extraHeaders,
   };
-  if (OPENROUTER_SITE_URL) upstreamHeaders["http-referer"] = OPENROUTER_SITE_URL;
-  if (OPENROUTER_APP_TITLE) upstreamHeaders["x-title"] = OPENROUTER_APP_TITLE;
 
   const usage = emptyUsage();
 
@@ -192,18 +216,18 @@ app.post("/v1/chat/completions", async (c) => {
 
   let upstream: Response;
   try {
-    upstream = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+    upstream = await fetch(`${provider.baseUrl}/chat/completions`, {
       method: "POST",
       headers: upstreamHeaders,
       body: JSON.stringify(upstreamBody),
     });
   } catch (err) {
-    console.error("[upstream] fetch failed:", err);
+    console.error(`[upstream:${provider.name}] fetch failed:`, err);
     finalize(502, String(err));
     return c.json(
       {
         error: {
-          message: "Upstream request to OpenRouter failed.",
+          message: `Upstream request to ${provider.name} failed.`,
           type: "upstream_error",
         },
       },
@@ -229,10 +253,12 @@ app.post("/v1/chat/completions", async (c) => {
       const json = JSON.parse(text);
       if (json && typeof json === "object") {
         if (json.usage) mergeUsage(usage, json.usage);
+        finalizeCost(decision.provider, decision.model, usage);
         json.model = requestedModel;
         if (!json._router) {
           json._router = {
             requested: requestedModel,
+            provider: decision.provider,
             routed_to: decision.model,
             tier: decision.tier,
             reason: decision.reason,
@@ -244,6 +270,7 @@ app.post("/v1/chat/completions", async (c) => {
       finalize(upstream.status, null);
       return c.json(json, upstream.status as 200);
     } catch {
+      finalizeCost(decision.provider, decision.model, usage);
       finalize(upstream.status, "non-json upstream response");
       return new Response(text, {
         status: upstream.status,
@@ -304,6 +331,7 @@ app.post("/v1/chat/completions", async (c) => {
           const rewritten = rewriteSseEvent(buffer, requestedModel, usage);
           controller.enqueue(encoder.encode(rewritten));
         }
+        finalizeCost(decision.provider, decision.model, usage);
         recordOnce(200, null);
       } catch (err) {
         console.error("[stream] error:", err);

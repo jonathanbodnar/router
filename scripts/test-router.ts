@@ -68,9 +68,16 @@ const cases: Array<{ name: string; req: Parameters<typeof route>[0] }> = [
     req: { model: "code", messages: [{ role: "user", content: "hi" }] },
   },
   {
-    name: "passthrough model id",
+    name: "passthrough OR model id",
     req: {
       model: "anthropic/claude-opus-4.7",
+      messages: [{ role: "user", content: "hi" }],
+    },
+  },
+  {
+    name: "passthrough Fireworks model id",
+    req: {
+      model: "accounts/fireworks/models/deepseek-v4-pro",
       messages: [{ role: "user", content: "hi" }],
     },
   },
@@ -79,6 +86,6 @@ const cases: Array<{ name: string; req: Parameters<typeof route>[0] }> = [
 for (const c of cases) {
   const d = route(c.req);
   console.log(
-    `${c.name.padEnd(34)} -> ${d.tier.padEnd(9)} (${d.model})  [${d.reason}]`,
+    `${c.name.padEnd(34)} -> ${d.tier.padEnd(9)} ${d.provider.padEnd(10)} ${d.model}  [${d.reason}]`,
   );
 }

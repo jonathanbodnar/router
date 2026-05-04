@@ -1,9 +1,9 @@
-# openrouter-auto-router
+# auto-router
 
-A tiny OpenAI-compatible HTTP service that sits in front of [OpenRouter](https://openrouter.ai)
-and **auto-picks the right model for each request** based on the task, then
-**logs every call** (model, project, tokens, cost) to a small SQLite-backed
-dashboard.
+A tiny OpenAI-compatible HTTP service that fronts [Fireworks](https://fireworks.ai)
+and [OpenRouter](https://openrouter.ai) and **auto-picks the right model for
+each request** based on the task, then **logs every call** (model, project,
+tokens, cost) to a small SQLite-backed dashboard.
 
 Designed to run on [Railway](https://railway.com) and be plugged into
 Cursor's "Override OpenAI Base URL" setting so every Cursor request is routed
@@ -11,12 +11,12 @@ to the most appropriate model — and you have a single pane of glass for spend.
 
 ## Routing table
 
-| Task type | Model |
-| --- | --- |
-| Cheap/general answering, summaries, first drafts, simple business copy | `deepseek/deepseek-v4-pro` |
-| Long-context agentic workflows, big docs, multi-step automation, heavy tool use | `xiaomi/mimo-v2.5-pro` |
-| High-quality product/dev work, code edits, debugging, structured reasoning | `anthropic/claude-sonnet-4.6` |
-| Highest-stakes reasoning, architecture, complex refactors, "must be excellent" output | `anthropic/claude-opus-4.7` |
+| Task type | Model | Provider |
+| --- | --- | --- |
+| Cheap/general answering, summaries, first drafts, simple business copy | `deepseek-v4-pro` | Fireworks |
+| Long-context agentic workflows, big docs, multi-step automation, heavy tool use | `xiaomi/mimo-v2.5-pro` | OpenRouter |
+| High-quality product/dev work, code edits, debugging, structured reasoning | `anthropic/claude-sonnet-4.6` | OpenRouter |
+| Highest-stakes reasoning, architecture, complex refactors, "must be excellent" output | `anthropic/claude-opus-4.7` | OpenRouter |
 
 The choice is made by `src/router.ts` using cheap heuristics (input length,
 presence of tools, code fences, file paths, dev verbs, architecture/reasoning
@@ -35,7 +35,9 @@ The `/dashboard` UI is HTTP-Basic protected (username `admin`, password
   including streaming. The `model` field accepts:
   - `auto` &mdash; classify and route automatically (recommended).
   - `cheap` / `agentic` / `code` / `reasoning` &mdash; force a specific tier.
-  - any concrete OpenRouter model id like `anthropic/claude-opus-4.7` &mdash; passthrough.
+  - any concrete model id &mdash; passthrough. Provider is inferred from the
+    id format: `accounts/fireworks/...` &rarr; Fireworks; everything else
+    (e.g. `anthropic/claude-opus-4.7`) &rarr; OpenRouter.
 - `GET  /dashboard` &mdash; HTML dashboard (totals, breakdowns, recent calls).
 - `GET  /dashboard/api/stats?period=24h|7d|30d|all` &mdash; the same data as JSON.
 
@@ -53,9 +55,15 @@ Every chat-completion request writes one row to `calls` in SQLite:
 | `requested_model` | what the client asked for (`auto`, alias, model id) |
 | `project` | detected from Cursor's `Workspace Path: …` system block, or the `X-Router-Project` header |
 | `work_type` | one of `bug_fix` / `rework` / `new_feature` / `other`, heuristic on the last user message; or `X-Router-Work-Type` header |
-| `prompt_tokens`, `completion_tokens`, `total_tokens` | from OpenRouter's `usage` (we inject `usage: { include: true }`) |
-| `cost_usd` | from OpenRouter's `usage.cost` — what your account is actually billed |
+| `prompt_tokens`, `completion_tokens`, `total_tokens` | from each provider's `usage` (we inject `usage: { include: true }` for OpenRouter) |
+| `cost_usd` | from `usage.cost` for OpenRouter (what your account is actually billed); computed locally from `src/pricing.ts` for Fireworks (Fireworks doesn't return cost in the response) |
 | `duration_ms`, `status`, `stream`, `error` | request bookkeeping |
+
+> Fireworks doesn't return cost in its responses, so we compute it from the
+> per-model price table in `src/pricing.ts`. Defaults are best-effort
+> placeholders ($0.50 / $1.50 per 1M in/out for DeepSeek V4 Pro). Override
+> via `PRICE_DEEPSEEK_V4_INPUT` and `PRICE_DEEPSEEK_V4_OUTPUT`, or just edit
+> `pricing.ts`.
 
 The dashboard slices that table by model, by project, by work-type, and gives
 you a live recent-calls list. There's a 24h / 7d / 30d / all period selector;
@@ -109,11 +117,15 @@ npx tsx scripts/http-smoke.ts
    build/start commands and the `/healthz` healthcheck.
 3. Under **Variables**, set:
    - `OPENROUTER_API_KEY` &mdash; your OpenRouter key (`sk-or-v1-...`).
+     Used for the agentic / code / reasoning tiers.
+   - `FIREWORKS_API_KEY` &mdash; your Fireworks key (`fw_...`).
+     Used for the cheap tier (DeepSeek V4 Pro).
    - `ROUTER_API_KEY` &mdash; a long random string. Cursor will use this.
    - `DASHBOARD_PASSWORD` &mdash; password for the `/dashboard` UI (optional;
      defaults to `ROUTER_API_KEY`).
    - `DATABASE_PATH=/data/router.db`.
-   - *(optional)* `OPENROUTER_SITE_URL`, `OPENROUTER_APP_TITLE`, `ROUTER_LOG=1`.
+   - *(optional)* `OPENROUTER_SITE_URL`, `OPENROUTER_APP_TITLE`, `ROUTER_LOG=1`,
+     `PRICE_DEEPSEEK_V4_INPUT`, `PRICE_DEEPSEEK_V4_OUTPUT`.
 4. Under **Settings &rarr; Volumes**, attach a small volume mounted at
    `/data`. This is where the SQLite call log lives so it survives redeploys.
 5. Under **Settings &rarr; Networking**, click **Generate Domain**. You'll
@@ -142,12 +154,14 @@ From here on, Cursor sends every request to your Railway service, which:
 
 ## Files
 
-- `src/index.ts` &mdash; Hono server, auth, OpenRouter proxy (streaming + non-streaming), call logging.
-- `src/router.ts` &mdash; routing heuristics + alias table.
+- `src/index.ts` &mdash; Hono server, auth, upstream proxy (streaming + non-streaming), call logging.
+- `src/router.ts` &mdash; routing heuristics + alias + tier-to-(provider, model) table.
+- `src/providers.ts` &mdash; provider configs (base URL, API key, headers, cost-from-usage flag).
+- `src/pricing.ts` &mdash; per-model price table for providers that don't return cost (Fireworks).
 - `src/classify.ts` &mdash; project + work-type detection (with header overrides).
 - `src/db.ts` &mdash; SQLite schema, `recordCall`, dashboard queries.
 - `src/dashboard.ts` &mdash; HTML dashboard + JSON stats API + Basic-auth gate.
 - `scripts/test-router.ts` &mdash; offline sanity checks for the classifier.
 - `scripts/smoke.ts` &mdash; offline DB / classifier smoke test.
-- `scripts/http-smoke.ts` &mdash; full HTTP smoke test against a fake OpenRouter.
+- `scripts/http-smoke.ts` &mdash; full HTTP smoke test against a fake upstream (covers both providers).
 - `railway.json` &mdash; build/start commands and healthcheck for Railway.
