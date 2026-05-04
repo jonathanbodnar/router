@@ -717,6 +717,138 @@ app.post("/v1/chat/completions", async (c) => {
 
   /* ---------- streaming ---------- */
 
+  const sseHeaders = new Headers({
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+  });
+
+  // Heartbeat for thinking models (MiMo): Cursor sees "gpt-4.1" and
+  // expects content within ~3s. MiMo's upstream fetch alone takes ~4s
+  // before the first byte. We must return the response stream to
+  // Cursor BEFORE the fetch so heartbeats flow immediately.
+  const needsHeartbeat = HEARTBEAT_MODELS.has(actualModel) && isStream;
+  const HEARTBEAT_MS = 1_500;
+
+  if (needsHeartbeat) {
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    const clearHB = () => {
+      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    };
+
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const encoder = new TextEncoder();
+        let seenRealContent = false;
+        let recorded = false;
+        const recordOnce = (status: number, err: string | null) => {
+          if (recorded) return;
+          recorded = true;
+          finalize(status, err);
+        };
+
+        const emitHeartbeat = () => {
+          if (seenRealContent) { clearHB(); return; }
+          const hb = JSON.stringify({
+            id: `hb-${Date.now()}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: requestedModel,
+            choices: [{
+              index: 0,
+              delta: { role: "assistant", content: " " },
+              finish_reason: null,
+            }],
+          });
+          try { controller.enqueue(encoder.encode(`data: ${hb}\n\n`)); }
+          catch { /* stream closed */ }
+        };
+
+        // Fire first heartbeat IMMEDIATELY so Cursor sees content
+        // before its ~3s timeout, then repeat every 1.5s.
+        emitHeartbeat();
+        heartbeatTimer = setInterval(emitHeartbeat, HEARTBEAT_MS);
+
+        try {
+          // Fetch upstream INSIDE the stream — the response is already
+          // flowing to Cursor with heartbeats while we wait for MiMo.
+          const upstreamResp = await callUpstreamWithFallback();
+
+          if (!upstreamResp.ok || !upstreamResp.body) {
+            clearHB();
+            const text = await upstreamResp.text();
+            console.error(
+              `[upstream:${actualProvider.name}] ${upstreamResp.status} (hb-stream) body=${text.slice(0, 800)}`,
+            );
+            const errChunk = JSON.stringify({
+              id: `err-${Date.now()}`,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: requestedModel,
+              choices: [{
+                index: 0,
+                delta: { content: `\n[upstream error: ${upstreamResp.status}]` },
+                finish_reason: "stop",
+              }],
+            });
+            controller.enqueue(encoder.encode(`data: ${errChunk}\n\ndata: [DONE]\n\n`));
+            recordOnce(upstreamResp.status, text.slice(0, 500));
+            controller.close();
+            return;
+          }
+
+          const reader = upstreamResp.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            let sep: number;
+            while ((sep = buffer.indexOf("\n\n")) !== -1) {
+              const rawEvent = buffer.slice(0, sep);
+              buffer = buffer.slice(sep + 2);
+              const rewritten = rewriteSseEvent(
+                rawEvent, requestedModel, usage, captured,
+              );
+              if (!seenRealContent && rewritten.includes('"content":"') &&
+                  !rewritten.includes('"content":""')) {
+                seenRealContent = true;
+                clearHB();
+              }
+              controller.enqueue(encoder.encode(rewritten + "\n\n"));
+            }
+          }
+          clearHB();
+          if (buffer.length > 0) {
+            controller.enqueue(encoder.encode(
+              rewriteSseEvent(buffer, requestedModel, usage, captured),
+            ));
+          }
+          finalizeCost(actualProvider.name, actualModel, usage);
+          recordOnce(200, null);
+        } catch (err) {
+          clearHB();
+          console.error("[stream] error:", err);
+          controller.error(err);
+          return;
+        }
+        controller.close();
+      },
+      cancel(reason) {
+        clearHB();
+        if (log) console.log("[stream] cancelled:", reason);
+      },
+    });
+
+    return new Response(stream, { status: 200, headers: sseHeaders });
+  }
+
+  // ---- Standard (non-heartbeat) streaming path ----
+
   if (!upstream.ok || !upstream.body) {
     const text = await upstream.text();
     console.error(
@@ -732,24 +864,6 @@ app.post("/v1/chat/completions", async (c) => {
     });
   }
 
-  const headers = new Headers({
-    "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache, no-transform",
-    connection: "keep-alive",
-    "x-accel-buffering": "no",
-  });
-
-  // Heartbeat: for thinking models (MiMo) that produce reasoning
-  // tokens before content, inject synthetic " " content every ~2s
-  // so Cursor (which sees "gpt-4.1") doesn't timeout and retry.
-  const needsHeartbeat = HEARTBEAT_MODELS.has(actualModel);
-  const HEARTBEAT_MS = 2_000;
-
-  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  const clearHeartbeat = () => {
-    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-  };
-
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const reader = upstream.body!.getReader();
@@ -763,32 +877,6 @@ app.post("/v1/chat/completions", async (c) => {
         finalize(status, err);
       };
 
-      let seenRealContent = false;
-
-      if (needsHeartbeat) {
-        heartbeatTimer = setInterval(() => {
-          if (seenRealContent) {
-            clearInterval(heartbeatTimer!);
-            heartbeatTimer = null;
-            return;
-          }
-          const hb = JSON.stringify({
-            id: `hb-${Date.now()}`,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: requestedModel,
-            choices: [{
-              index: 0,
-              delta: { role: "assistant", content: " " },
-              finish_reason: null,
-            }],
-          });
-          try {
-            controller.enqueue(encoder.encode(`data: ${hb}\n\n`));
-          } catch { /* stream already closed */ }
-        }, HEARTBEAT_MS);
-      }
-
       try {
         for (;;) {
           const { value, done } = await reader.read();
@@ -800,33 +888,19 @@ app.post("/v1/chat/completions", async (c) => {
             const rawEvent = buffer.slice(0, sep);
             buffer = buffer.slice(sep + 2);
             const rewritten = rewriteSseEvent(
-              rawEvent,
-              requestedModel,
-              usage,
-              captured,
+              rawEvent, requestedModel, usage, captured,
             );
-            if (!seenRealContent && rewritten.includes('"content":"') &&
-                !rewritten.includes('"content":""')) {
-              seenRealContent = true;
-              clearHeartbeat();
-            }
             controller.enqueue(encoder.encode(rewritten + "\n\n"));
           }
         }
-        clearHeartbeat();
         if (buffer.length > 0) {
-          const rewritten = rewriteSseEvent(
-            buffer,
-            requestedModel,
-            usage,
-            captured,
-          );
-          controller.enqueue(encoder.encode(rewritten));
+          controller.enqueue(encoder.encode(
+            rewriteSseEvent(buffer, requestedModel, usage, captured),
+          ));
         }
         finalizeCost(actualProvider.name, actualModel, usage);
         recordOnce(200, null);
       } catch (err) {
-        clearHeartbeat();
         console.error("[stream] error:", err);
         recordOnce(500, String(err));
         controller.error(err);
@@ -835,12 +909,11 @@ app.post("/v1/chat/completions", async (c) => {
       controller.close();
     },
     cancel(reason) {
-      clearHeartbeat();
       if (log) console.log("[stream] cancelled:", reason);
     },
   });
 
-  return new Response(stream, { status: 200, headers });
+  return new Response(stream, { status: 200, headers: sseHeaders });
 });
 
 /**
