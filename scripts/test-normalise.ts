@@ -8,7 +8,11 @@
  *     requests 500ing every time on every OpenRouter Anthropic / MiMo
  *     call when the prompt had tools attached.
  */
-import { nestFlatTools, normaliseBody } from "../src/normalise.js";
+import {
+  inputArrayToMessages,
+  nestFlatTools,
+  normaliseBody,
+} from "../src/normalise.js";
 
 let failed = 0;
 const expect = (name: string, ok: boolean, detail = "") => {
@@ -147,6 +151,204 @@ console.log("\n=== normaliseBody (Cursor + tools, end-to-end) ===\n");
   };
   const { adapted } = normaliseBody(before);
   expect("no-op case has empty adapted list", adapted.length === 0);
+}
+
+console.log("\n=== inputArrayToMessages (Responses API conversation) ===\n");
+
+{
+  // The exact shape Cursor sends: system message with string content,
+  // user message with typed-parts array content. The previous bug was
+  // returning "" for the user message because content was an array.
+  const msgs = inputArrayToMessages([
+    { role: "system", content: "you are a coding agent" },
+    {
+      role: "user",
+      content: [{ type: "input_text", text: "summarize this project" }],
+    },
+  ]);
+  expect("two messages produced", msgs.length === 2, `got ${msgs.length}`);
+  expect("system role preserved", msgs[0].role === "system");
+  expect("system content preserved", msgs[0].content === "you are a coding agent");
+  expect("user role preserved", msgs[1].role === "user");
+  expect(
+    "typed-parts array flattened to text",
+    msgs[1].content === "summarize this project",
+    `got ${JSON.stringify(msgs[1].content)}`,
+  );
+}
+
+{
+  // Multiple typed parts in one message -> joined with newlines.
+  const msgs = inputArrayToMessages([
+    {
+      role: "user",
+      content: [
+        { type: "input_text", text: "first part" },
+        { type: "input_text", text: "second part" },
+      ],
+    },
+  ]);
+  expect(
+    "multiple parts joined with newlines",
+    msgs[0].content === "first part\nsecond part",
+    `got ${JSON.stringify(msgs[0].content)}`,
+  );
+}
+
+{
+  // function_call -> assistant tool_calls
+  const msgs = inputArrayToMessages([
+    {
+      type: "function_call",
+      call_id: "call_abc",
+      name: "Shell",
+      arguments: '{"command":"ls"}',
+    },
+  ]);
+  expect("function_call -> 1 message", msgs.length === 1);
+  expect("function_call -> assistant role", msgs[0].role === "assistant");
+  expect("function_call -> null content", msgs[0].content === null);
+  expect("function_call -> tool_calls present", Array.isArray(msgs[0].tool_calls));
+  expect("function_call name preserved", msgs[0].tool_calls?.[0].function.name === "Shell");
+  expect(
+    "function_call arguments preserved",
+    msgs[0].tool_calls?.[0].function.arguments === '{"command":"ls"}',
+  );
+  expect("function_call id preserved", msgs[0].tool_calls?.[0].id === "call_abc");
+}
+
+{
+  // function_call_output -> tool message with tool_call_id
+  const msgs = inputArrayToMessages([
+    { type: "function_call_output", call_id: "call_abc", output: "total 0\n" },
+  ]);
+  expect("function_call_output -> tool role", msgs[0].role === "tool");
+  expect(
+    "function_call_output -> tool_call_id wired",
+    msgs[0].tool_call_id === "call_abc",
+  );
+  expect("function_call_output -> output content", msgs[0].content === "total 0\n");
+}
+
+{
+  // Realistic multi-turn: system, user, assistant calls Shell, tool result,
+  // assistant final text.
+  const msgs = inputArrayToMessages([
+    { role: "system", content: "you are an agent" },
+    { role: "user", content: [{ type: "input_text", text: "list files" }] },
+    {
+      type: "function_call",
+      call_id: "c1",
+      name: "Shell",
+      arguments: '{"command":"ls"}',
+    },
+    { type: "function_call_output", call_id: "c1", output: "a.txt\nb.txt" },
+    { role: "assistant", content: "There are two files: a.txt and b.txt." },
+  ]);
+  expect("multi-turn produces 5 messages", msgs.length === 5);
+  expect("turn 0 system", msgs[0].role === "system");
+  expect("turn 1 user with extracted text", msgs[1].role === "user" && msgs[1].content === "list files");
+  expect(
+    "turn 2 assistant tool_calls",
+    msgs[2].role === "assistant" && msgs[2].content === null && Array.isArray(msgs[2].tool_calls),
+  );
+  expect(
+    "turn 3 tool result",
+    msgs[3].role === "tool" && msgs[3].tool_call_id === "c1" && msgs[3].content === "a.txt\nb.txt",
+  );
+  expect(
+    "turn 4 assistant final text",
+    msgs[4].role === "assistant" && msgs[4].content === "There are two files: a.txt and b.txt.",
+  );
+}
+
+console.log("\n=== normaliseBody: Cursor-shaped Responses API request ===\n");
+
+{
+  // Reproduces the exact request keys observed in Railway logs:
+  //   keys=[user,model,input,tools,store,stream,metadata,stream_options]
+  // and the input shape that broke before this fix.
+  const before = {
+    user: "9057d5091e396134",
+    model: "gpt-4.1",
+    store: true,
+    stream: true,
+    stream_options: { include_usage: true },
+    metadata: { project: "shoutout" },
+    input: [
+      { role: "system", content: "you are a coding agent" },
+      {
+        role: "user",
+        content: [{ type: "input_text", text: "scan the project and summarize" }],
+      },
+    ],
+    tools: [
+      {
+        type: "function",
+        name: "Shell",
+        description: "run a shell command",
+        parameters: { type: "object", properties: {} },
+        strict: false,
+      },
+    ],
+  };
+  const { body, adapted } = normaliseBody(before);
+
+  expect(
+    "tools translated",
+    adapted.includes("tools(flat->nested)"),
+    `adapted=${JSON.stringify(adapted)}`,
+  );
+  expect(
+    "input[] processed",
+    adapted.includes("input[]"),
+    `adapted=${JSON.stringify(adapted)}`,
+  );
+  expect(
+    "store stripped",
+    adapted.some((a) => a.startsWith("stripped:") && a.includes("store")),
+    `adapted=${JSON.stringify(adapted)}`,
+  );
+
+  expect(
+    "messages array built",
+    Array.isArray(body.messages) && (body.messages as any[]).length === 2,
+    `messages=${JSON.stringify(body.messages)}`,
+  );
+  const msgs = body.messages as any[];
+  expect("system message preserved", msgs[0].role === "system" && msgs[0].content === "you are a coding agent");
+  expect(
+    "user message extracted from typed parts (THE BUG WAS HERE)",
+    msgs[1].role === "user" && msgs[1].content === "scan the project and summarize",
+    `user.content=${JSON.stringify(msgs[1].content)}`,
+  );
+
+  expect("input field removed", body.input === undefined);
+  expect("store field removed", body.store === undefined);
+  expect("metadata preserved", body.metadata !== undefined);
+  expect(
+    "tools nested",
+    (body.tools as any[])[0].function?.name === "Shell",
+  );
+  expect("model preserved", body.model === "gpt-4.1");
+  expect("stream preserved", body.stream === true);
+}
+
+{
+  // text.format -> response_format
+  const before = {
+    model: "auto",
+    input: "hi",
+    text: { format: { type: "json_schema", schema: { type: "object" } } },
+  };
+  const { body, adapted } = normaliseBody(before);
+  expect(
+    "text.format translated",
+    adapted.some((a) => a.includes("text.format->response_format")),
+    `adapted=${JSON.stringify(adapted)}`,
+  );
+  expect("response_format set", (body as any).response_format?.type === "json_schema");
+  expect("text field removed", body.text === undefined);
 }
 
 if (failed > 0) {
