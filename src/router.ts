@@ -1,18 +1,26 @@
 /**
  * Routing logic.
  *
- * The router maps an incoming OpenAI-style chat completion request to one of
- * four backing models across two providers:
+ * The router maps an incoming OpenAI-style chat completion request to one
+ * of four backing models across two providers:
  *
- *   - cheap     -> Fireworks (DeepSeek V4 Pro)
- *   - agentic   -> OpenRouter (Xiaomi MiMo V2.5 Pro)
- *   - code      -> OpenRouter (Anthropic Claude Sonnet 4.6)
- *   - reasoning -> OpenRouter (Anthropic Claude Opus 4.7)
+ *   - cheap     -> Fireworks  (DeepSeek V4 Pro)               non-dev work
+ *   - agentic   -> OpenRouter (Xiaomi MiMo V2.5 Pro)          easy/medium dev work, long-context bulk
+ *   - code      -> OpenRouter (Anthropic Claude Sonnet 4.6)   moderate dev work, substantial code
+ *   - reasoning -> OpenRouter (Anthropic Claude Opus 4.7)     hard reasoning, architecture, complex refactors
+ *
+ * The "agentic" alias is kept for backward compatibility; "easy" works
+ * too. Mental model:
+ *
+ *   non-dev      -> cheap     (DeepSeek)
+ *   easy dev     -> agentic   (MiMo)
+ *   moderate dev -> code      (Sonnet)
+ *   hard dev     -> reasoning (Opus)
  *
  * The dispatch is based on either:
  *
  *   1. An explicit alias the client passed as `model`
- *      (e.g. "auto", "cheap", "agentic", "code", "reasoning"), OR
+ *      (e.g. "auto", "cheap", "easy", "agentic", "code", "reasoning"), OR
  *   2. A heuristic classification of the request when `model` is "auto"
  *      (or the alias / model is unrecognised).
  *
@@ -47,12 +55,17 @@ const ALIASES: Record<string, Tier> = {
   general: "cheap",
   fast: "cheap",
   agentic: "agentic",
+  easy: "agentic",
+  basic: "agentic",
+  mimo: "agentic",
   "long-context": "agentic",
   longcontext: "agentic",
   long: "agentic",
   code: "code",
   dev: "code",
   coder: "code",
+  moderate: "code",
+  sonnet: "code",
   reasoning: "reasoning",
   hard: "reasoning",
   opus: "reasoning",
@@ -125,8 +138,9 @@ const REASONING_RE =
   /\b(architect(?:ure)?|system design|design system|design doc|trade ?off|complex refactor|large refactor|migrate|migration plan|critical|production[- ]grade|mission[- ]critical|deeply analyze|prove|formal|invariant|consistency model|distributed system|threat model|security review|reason step ?by ?step|chain[- ]of[- ]thought|hard problem|highest stakes)\b/i;
 
 /** Heuristic token thresholds, tuned for Cursor-style traffic. */
-const LONG_CONTEXT_TOKENS = 32_000; // anything bigger -> agentic / long-context tier
+const LONG_CONTEXT_TOKENS = 32_000; // bulk-doc threshold for MiMo when no tools
 const REASONING_MIN_TOKENS = 1_500; // need some substance before we go to opus
+const MODERATE_CODE_TOKENS = 5_000; // above this, code work goes to Sonnet not MiMo
 const CODE_MIN_TOKENS = 200;
 
 /* ---------- main classifier ---------- */
@@ -144,35 +158,23 @@ function classify(req: IncomingRequest): RouteDecision {
     approxInputTokens: tokens,
   });
 
-  // 1. Long context with NO tools -> mimo.
-  //    MiMo via OpenRouter rejects OpenAI-shaped tool definitions
-  //    ("Param Incorrect, param: function is not set"), so anything that
-  //    has tools must go to a model that natively understands OpenAI tools
-  //    (Sonnet / Opus). Tool-heavy agent loops therefore fall through to
-  //    the code/reasoning tiers below regardless of context size.
-  if (tools === 0 && tokens >= LONG_CONTEXT_TOKENS) {
-    return decide("agentic", `long context (~${tokens} tok, no tools)`);
-  }
-
   const hasCodeFence = CODE_FENCE_RE.test(text);
   CODE_FENCE_RE.lastIndex = 0;
   const hasFilePath = FILE_PATH_RE.test(text);
   const hasDevVerb = DEV_TASK_RE.test(text);
   const hasCodeyTokens = CODEY_TOKENS_RE.test(text);
 
-  // Strong code signals: any one of these is enough on its own, regardless of
-  // length. A fence, an explicit file path, or a dev verb means the user is
-  // clearly doing dev work.
+  // Strong code signals: any one of these is enough on its own, regardless
+  // of length. A fence, an explicit file path, or a dev verb means the
+  // user is clearly doing dev work.
   const strongCodeSignal = hasCodeFence || hasFilePath || hasDevVerb;
-  // Weak code signals (just "function" / "class" etc. in prose) still need
-  // some volume to avoid false positives.
   const weakCodeSignal = hasCodeyTokens;
-
+  const codeSignal = strongCodeSignal || weakCodeSignal;
   const looksReasoning = REASONING_RE.test(text);
 
-  // 2. Highest-stakes reasoning -> opus.
-  //    Require both a reasoning signal AND meaningful substance, otherwise
-  //    casual mentions of "architecture" don't blow the budget.
+  // 1. Highest-stakes reasoning / architecture -> Opus.
+  //    Require both a reasoning signal AND meaningful substance; casual
+  //    mentions of "architecture" alone shouldn't blow the budget.
   if (looksReasoning && tokens >= REASONING_MIN_TOKENS) {
     return decide(
       "reasoning",
@@ -180,29 +182,35 @@ function classify(req: IncomingRequest): RouteDecision {
     );
   }
 
-  // 3. Code / dev work -> sonnet.
-  if (strongCodeSignal) {
-    return decide(
-      "code",
-      `code/dev signal (~${tokens} tok, tools=${tools})`,
-    );
+  // 2. Long-context bulk work with NO tools -> MiMo (1M context, cheap).
+  //    Pasted-doc summarisation, big code reads, etc.
+  if (tools === 0 && tokens >= LONG_CONTEXT_TOKENS) {
+    return decide("agentic", `long context (~${tokens} tok, no tools)`);
   }
-  if (weakCodeSignal && tokens >= CODE_MIN_TOKENS) {
+
+  // 3. Substantial code work -> Sonnet (moderate dev tier).
+  //    Strong code signals + meaningful prompt size means the user is
+  //    asking for non-trivial dev work; lean on Sonnet for quality.
+  if (strongCodeSignal && tokens >= MODERATE_CODE_TOKENS) {
     return decide(
       "code",
-      `code-ish prose (~${tokens} tok, tools=${tools})`,
-    );
-  }
-  // Tools present at all is a strong "this is a dev/agent task" signal even
-  // if the prompt itself is short.
-  if (tools > 0) {
-    return decide(
-      "code",
-      `tool-calling request (${tools} tools, ~${tokens} tok)`,
+      `substantial code work (~${tokens} tok, tools=${tools})`,
     );
   }
 
-  // 4. Default: cheap general-purpose.
+  // 4. Easy/medium dev work and short tool-calling -> MiMo.
+  //    Quick changes, simple debugging, day-to-day Cursor coding. MiMo
+  //    handles tools natively.
+  if (codeSignal || tools > 0) {
+    const why = strongCodeSignal
+      ? "code/dev signal"
+      : weakCodeSignal && tokens >= CODE_MIN_TOKENS
+        ? "code-ish prose"
+        : "tool-calling request";
+    return decide("agentic", `${why} (~${tokens} tok, tools=${tools})`);
+  }
+
+  // 5. Default: non-dev / general-purpose -> DeepSeek (cheap).
   return decide("cheap", `general/short prompt (~${tokens} tok)`);
 }
 

@@ -11,12 +11,17 @@ to the most appropriate model — and you have a single pane of glass for spend.
 
 ## Routing table
 
-| Task type | Model | Provider |
-| --- | --- | --- |
-| Cheap/general answering, summaries, first drafts, simple business copy | `deepseek-v4-pro` | Fireworks |
-| Long-context agentic workflows, big docs, multi-step automation, heavy tool use | `xiaomi/mimo-v2.5-pro` | OpenRouter |
-| High-quality product/dev work, code edits, debugging, structured reasoning | `anthropic/claude-sonnet-4.6` | OpenRouter |
-| Highest-stakes reasoning, architecture, complex refactors, "must be excellent" output | `anthropic/claude-opus-4.7` | OpenRouter |
+| Tier | Model | Provider | When |
+| --- | --- | --- | --- |
+| `cheap` | `deepseek-v4-pro` | Fireworks | Non-dev work — summaries, first drafts, business copy, general Q&A |
+| `agentic` (alias `easy`) | `xiaomi/mimo-v2.5-pro` | OpenRouter | Default for everyday dev work — quick changes, simple debugging, day-to-day Cursor coding. Also long-context bulk work (1M context window, fast). |
+| `code` (alias `moderate`) | `anthropic/claude-sonnet-4.6` | OpenRouter | Substantial code work — non-trivial refactors, multi-file context (~5k+ tokens of code), structured reasoning |
+| `reasoning` (alias `hard`) | `anthropic/claude-opus-4.7` | OpenRouter | Architecture, complex refactors, "must be excellent" reasoning |
+
+The classifier (in `src/router.ts`) picks a tier from cheapest to highest in
+this rough order: reasoning signal + substance &rarr; Opus; long context with
+no tools &rarr; MiMo; substantial code work &rarr; Sonnet; any code/tool
+signal &rarr; MiMo; otherwise &rarr; DeepSeek.
 
 The choice is made by `src/router.ts` using cheap heuristics (input length,
 presence of tools, code fences, file paths, dev verbs, architecture/reasoning
