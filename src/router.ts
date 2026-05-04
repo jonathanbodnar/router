@@ -135,7 +135,6 @@ function classify(req: IncomingRequest): RouteDecision {
   const text = fullText(req);
   const tokens = approxTokens(text);
   const tools = Array.isArray(req.tools) ? req.tools.length : 0;
-  const numMessages = req.messages?.length ?? 0;
 
   const decide = (tier: Tier, reason: string): RouteDecision => ({
     tier,
@@ -145,15 +144,14 @@ function classify(req: IncomingRequest): RouteDecision {
     approxInputTokens: tokens,
   });
 
-  // 1. Long context or heavy tool-use agentic loops -> mimo.
-  if (tokens >= LONG_CONTEXT_TOKENS) {
-    return decide("agentic", `long context (~${tokens} tok)`);
-  }
-  if (tools > 0 && (tokens >= 6_000 || numMessages >= 12)) {
-    return decide(
-      "agentic",
-      `tool-heavy agent loop (${tools} tools, ${numMessages} msgs, ~${tokens} tok)`,
-    );
+  // 1. Long context with NO tools -> mimo.
+  //    MiMo via OpenRouter rejects OpenAI-shaped tool definitions
+  //    ("Param Incorrect, param: function is not set"), so anything that
+  //    has tools must go to a model that natively understands OpenAI tools
+  //    (Sonnet / Opus). Tool-heavy agent loops therefore fall through to
+  //    the code/reasoning tiers below regardless of context size.
+  if (tools === 0 && tokens >= LONG_CONTEXT_TOKENS) {
+    return decide("agentic", `long context (~${tokens} tok, no tools)`);
   }
 
   const hasCodeFence = CODE_FENCE_RE.test(text);

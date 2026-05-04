@@ -39,11 +39,22 @@ const cases: Array<{ name: string; req: Parameters<typeof route>[0] }> = [
     },
   },
   {
-    name: "long-context doc",
+    name: "long-context doc (no tools)",
     req: {
       model: "auto",
       messages: [
         { role: "user", content: "summarize this:\n" + "lorem ipsum ".repeat(20000) },
+      ],
+    },
+  },
+  {
+    name: "long-context + tools (Cursor-like)",
+    req: {
+      model: "gpt-4.1",
+      tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
+      messages: [
+        { role: "system", content: "you are an agent." },
+        { role: "user", content: "fix the bug:\n" + "lorem ipsum ".repeat(15000) },
       ],
     },
   },
