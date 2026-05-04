@@ -1,4 +1,4 @@
-import type { ChatMessage, IncomingRequest } from "./router.js";
+import { ALIASES, type ChatMessage, type IncomingRequest } from "./router.js";
 
 /* ---------- project detection ---------- */
 
@@ -141,6 +141,86 @@ export function resolveProject(
   if (h) return h;
   if (modelTag) return modelTag;
   return detectProject(req);
+}
+
+/* ---------- in-prompt routing override ---------- */
+
+/**
+ * Look at the last user message and check if it starts with an inline
+ * routing tag like `!hard`, `!cheap`, `!sonnet`, `[opus]`, etc. If so:
+ *
+ *   - extract the alias,
+ *   - strip the tag (and any leading whitespace) from the message,
+ *   - return a NEW request with the modified message and `model` set
+ *     to the alias so `route()` will resolve it.
+ *
+ * Recognised forms (case-insensitive, must be at the very start):
+ *
+ *   !alias    rest...
+ *   [alias]   rest...
+ *
+ * Only valid aliases (those listed in router.ts ALIASES) are honoured —
+ * `!unknownword foo` is left untouched so we don't accidentally eat a
+ * legitimate `!important` style at the start of a message.
+ */
+const PROMPT_TAG_RE = /^[ \t]*(?:!([a-z][a-z0-9_-]*)|\[([a-z][a-z0-9_-]*)\])(?=[\s,:.\-]|$)([\s\S]*)$/i;
+
+export interface PromptOverride {
+  alias: string;
+  request: IncomingRequest;
+}
+
+function setMessageContent(m: ChatMessage, newText: string): ChatMessage {
+  const c = m.content;
+  if (typeof c === "string" || c == null) return { ...m, content: newText };
+  if (Array.isArray(c)) {
+    let replaced = false;
+    const parts = c.map((p) => {
+      if (!replaced && p && typeof p === "object" && typeof p.text === "string") {
+        replaced = true;
+        return { ...p, text: newText };
+      }
+      return p;
+    });
+    if (!replaced) {
+      parts.unshift({ type: "text", text: newText });
+    }
+    return { ...m, content: parts };
+  }
+  return { ...m, content: newText };
+}
+
+export function parsePromptOverride(req: IncomingRequest): PromptOverride | null {
+  const messages = req.messages ?? [];
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "user") {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  if (lastUserIdx === -1) return null;
+
+  const msg = messages[lastUserIdx]!;
+  const text = messageText(msg);
+  if (!text) return null;
+
+  const m = PROMPT_TAG_RE.exec(text);
+  if (!m) return null;
+  const alias = (m[1] ?? m[2] ?? "").toLowerCase();
+  if (!alias || !(alias in ALIASES)) return null;
+
+  // Strip the matched tag and any single delimiter (`:` `,` `-` `–` or
+  // whitespace) immediately after it. We keep the rest verbatim.
+  const rest = (m[3] ?? "").replace(/^[\s,:.\-–—]+/, "");
+
+  const newMessages = messages.slice();
+  newMessages[lastUserIdx] = setMessageContent(msg, rest);
+
+  return {
+    alias,
+    request: { ...req, messages: newMessages, model: alias },
+  };
 }
 
 export function resolveWorkType(

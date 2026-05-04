@@ -27,6 +27,36 @@ The choice is made by `src/router.ts` using cheap heuristics (input length,
 presence of tools, code fences, file paths, dev verbs, architecture/reasoning
 keywords). See that file for the exact rules.
 
+For requests where the heuristic is uncertain — medium-sized prompts with no
+strong reasoning signal — a tiny **hybrid LLM classifier** (`src/llm-classifier.ts`)
+quickly asks DeepSeek to label the task as `easy` / `moderate` / `hard` and
+**upgrades** the routing to Sonnet or Opus when warranted. It only ever
+upgrades, never downgrades, has a hard timeout (default 1.5s), caches by
+content hash for 5 minutes so retries don't pay twice, and folds its own
+tiny cost into the call's `cost_usd`. Disable with `ROUTER_LLM_CLASSIFIER=0`.
+
+### Picking the model from inside a prompt
+
+You don't have to switch the Cursor model dropdown to force a tier. Start
+your message with one of these and the router strips the tag and forces
+that tier — the underlying model never sees the tag:
+
+| Prefix | Tier | Model |
+| --- | --- | --- |
+| `!cheap` &middot; `!fast` | cheap | DeepSeek |
+| `!easy` &middot; `!mimo` &middot; `!agentic` | agentic | MiMo |
+| `!code` &middot; `!moderate` &middot; `!sonnet` | code | Sonnet |
+| `!hard` &middot; `!reasoning` &middot; `!opus` | reasoning | Opus |
+
+Both `!alias` and `[alias]` forms are accepted (e.g. `[opus]: deep dive on...`).
+Anything after the tag is forwarded as-is, with leading punctuation stripped.
+
+```text
+!hard plan a refactor of the billing service
+[opus]: review this consensus algorithm for correctness
+!cheap quick — what does this regex do?
+```
+
 ## Endpoints
 
 All `/v1/*` endpoints require `Authorization: Bearer $ROUTER_API_KEY`.
@@ -128,6 +158,13 @@ Smoke-test the routing classifier (no network):
 npx tsx scripts/test-router.ts
 ```
 
+Smoke-test the prompt-override parser and the hybrid LLM classifier
+(unit tests, mocked fetch — no network):
+
+```bash
+npx tsx scripts/test-classifier.ts
+```
+
 Smoke-test the full HTTP loop against a fake OpenRouter (no network, no DB
 in your repo — uses `.tmp-http-smoke.db`):
 
@@ -187,10 +224,14 @@ From here on, Cursor sends every request to your Railway service, which:
 - `src/router.ts` &mdash; routing heuristics + alias + tier-to-(provider, model) table.
 - `src/providers.ts` &mdash; provider configs (base URL, API key, headers, cost-from-usage flag).
 - `src/pricing.ts` &mdash; per-model price table for providers that don't return cost (Fireworks).
-- `src/classify.ts` &mdash; project + work-type detection (with header overrides).
+- `src/classify.ts` &mdash; project + work-type detection, plus the `!alias` in-prompt override parser.
+- `src/llm-classifier.ts` &mdash; hybrid LLM classifier (uncertain-band only, with timeout + cache).
 - `src/db.ts` &mdash; SQLite schema, `recordCall`, dashboard queries.
 - `src/dashboard.ts` &mdash; HTML dashboard + JSON stats API + Basic-auth gate.
-- `scripts/test-router.ts` &mdash; offline sanity checks for the classifier.
+- `scripts/test-router.ts` &mdash; offline sanity checks for the heuristic classifier.
+- `scripts/test-classifier.ts` &mdash; unit tests for prompt overrides + hybrid LLM classifier (mocked).
+- `scripts/test-fallback.ts` &mdash; end-to-end test for upstream-failure fallback + prompt overrides.
+- `scripts/test-normalise.ts` &mdash; unit tests for body-shape normalisation.
 - `scripts/smoke.ts` &mdash; offline DB / classifier smoke test.
 - `scripts/http-smoke.ts` &mdash; full HTTP smoke test against a fake upstream (covers both providers).
 - `railway.json` &mdash; build/start commands and healthcheck for Railway.

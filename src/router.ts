@@ -48,8 +48,9 @@ export const MODELS: Record<Tier, TierEntry> = {
   reasoning: { provider: "openrouter", model: "anthropic/claude-opus-4.7" },
 };
 
-/** Aliases the user can request directly as `model`. */
-const ALIASES: Record<string, Tier> = {
+/** Aliases the user can request directly as `model` (or as a `!alias` prefix
+ *  on the last user message — see `parsePromptOverride` in classify.ts). */
+export const ALIASES: Record<string, Tier> = {
   auto: "cheap", // placeholder; "auto" is handled specially below
   cheap: "cheap",
   general: "cheap",
@@ -134,8 +135,65 @@ const CODEY_TOKENS_RE =
 const DEV_TASK_RE =
   /\b(debug|fix (?:this|the|a) bug|stack ?trace|error|implement|refactor|unit ?test|integration ?test|code review|lint|type ?error|compile|build fail|regex|api endpoint|edit (?:this|the) file|write (?:a )?(?:function|component|hook|module|script))\b/i;
 
-const REASONING_RE =
-  /\b(system design|design doc|architectural (?:decision|choice|trade ?off)|complex refactor|large refactor|migration plan|production[- ]grade|mission[- ]critical|deeply analyze|formal proof|invariant|consistency model|distributed system|threat model|security audit|step ?by ?step reasoning|chain[- ]of[- ]thought|hard problem|highest stakes|why is this (?:the )?(?:correct|right) (?:approach|design)|prove that)\b/i;
+const REASONING_RE = new RegExp(
+  [
+    // architecture / design
+    "system design",
+    "design doc",
+    "design review",
+    "architectural (?:decision|choice|trade ?off|review)",
+    "high[- ]level design",
+    "end[- ]to[- ]end design",
+    "cross[- ]cutting concern",
+    // refactors / migrations
+    "complex refactor",
+    "large refactor",
+    "migration plan",
+    "schema migration",
+    "rollout plan",
+    "rollback strategy",
+    "breaking change",
+    // production / risk
+    "production[- ]grade",
+    "mission[- ]critical",
+    "highest stakes",
+    "must be excellent",
+    // analysis / proofs
+    "deeply analyze",
+    "deep dive",
+    "formal proof",
+    "invariant",
+    "step ?by ?step reasoning",
+    "chain[- ]of[- ]thought",
+    "prove that",
+    "why is this (?:the )?(?:correct|right) (?:approach|design)",
+    "trade[- ]offs?\\b.*\\bvs\\b",
+    // distributed systems / concurrency
+    "consistency model",
+    "distributed system",
+    "consensus",
+    "byzantine",
+    "raft\\b",
+    "paxos\\b",
+    "data race",
+    "race condition",
+    "thread[- ]safety",
+    "concurrency (?:bug|model|primitive)",
+    // performance / scalability
+    "performance bottleneck",
+    "algorithmic complexity",
+    "big[- ]?o\\b.*(?:analysis|complexity)",
+    "scaling strategy",
+    // security
+    "threat model",
+    "security audit",
+    "attack vector",
+    // hard / stakes language
+    "hard problem",
+    "very hard\\b",
+  ].join("|"),
+  "i",
+);
 
 /** Heuristic token thresholds, tuned for Cursor-style traffic. */
 const LONG_CONTEXT_TOKENS = 32_000; // bulk-doc threshold for MiMo when no tools

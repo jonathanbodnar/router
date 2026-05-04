@@ -3,11 +3,13 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import {
   parseModelProjectTag,
+  parsePromptOverride,
   resolveProject,
   resolveWorkType,
 } from "./classify.js";
 import { mountDashboard } from "./dashboard.js";
 import { recordCall } from "./db.js";
+import { DEFAULT_CONFIG as CLASSIFIER_CFG, maybeUpgradeWithLLM } from "./llm-classifier.js";
 import { computeCost } from "./pricing.js";
 import { loadProviders, type Provider } from "./providers.js";
 import { MODELS, route, type IncomingRequest } from "./router.js";
@@ -263,11 +265,74 @@ app.post("/v1/chat/completions", async (c) => {
     console.log(`[normalise] adapted fields: ${adapted.join(", ")} -> messages`);
   }
 
-  const body = normalisedBody as IncomingRequest;
+  let body = normalisedBody as IncomingRequest;
 
-  const decision = route(body);
-  const provider = PROVIDERS[decision.provider];
+  // Capture the originally-requested model BEFORE any override rewrites it,
+  // so the dashboard / response present what the client actually sent.
   const requestedModel = (body.model ?? "auto").toString();
+
+  // 1. In-prompt routing override: if the last user message starts with
+  //    `!hard`, `[opus]`, etc., strip it and force that tier. We do this
+  //    BEFORE classification so the heuristic and LLM classifier never see
+  //    the override tag and can't get confused by it.
+  let promptOverrideAlias: string | null = null;
+  const override = parsePromptOverride(body);
+  if (override) {
+    promptOverrideAlias = override.alias;
+    body = override.request;
+    if (log) {
+      console.log(`[prompt-override] alias=${promptOverrideAlias}`);
+    }
+  }
+
+  // 2. Heuristic routing (synchronous, fast).
+  const heuristicDecision = route(body);
+
+  // 3. Hybrid LLM classifier — only fires inside a narrow uncertain band
+  //    AND only when the user didn't explicitly override the tier in the
+  //    prompt or via an alias model name.
+  let decision = heuristicDecision;
+  let llmDifficulty: string | null = null;
+  let llmCostUsd = 0;
+  let llmDurationMs = 0;
+  let llmCached = false;
+  // Skip the classifier when the user has explicitly chosen a tier, either
+  // via the in-prompt `!alias` override or by passing an alias / concrete
+  // model id as `model`. We detect "user was explicit" from the routing
+  // reason: heuristic decisions start with the tier description, while
+  // explicit ones start with `alias "..."` or `passthrough`.
+  const wasExplicit =
+    promptOverrideAlias != null ||
+    /^(?:alias |passthrough)/.test(heuristicDecision.reason);
+  if (!wasExplicit) {
+    try {
+      const upgrade = await maybeUpgradeWithLLM(
+        body,
+        heuristicDecision,
+        PROVIDERS,
+        CLASSIFIER_CFG,
+      );
+      decision = upgrade.decision;
+      llmDifficulty = upgrade.difficulty;
+      llmCostUsd = upgrade.classifierCostUsd;
+      llmDurationMs = upgrade.durationMs;
+      llmCached = upgrade.cached;
+      if (log && upgrade.upgraded) {
+        console.log(
+          `[classifier] ${heuristicDecision.tier} -> ${decision.tier} ` +
+            `(difficulty=${llmDifficulty}, ${llmDurationMs}ms${llmCached ? ", cached" : ""})`,
+        );
+      } else if (log && llmDifficulty) {
+        console.log(
+          `[classifier] kept ${decision.tier} ` +
+            `(difficulty=${llmDifficulty}, ${llmDurationMs}ms${llmCached ? ", cached" : ""})`,
+        );
+      }
+    } catch (err) {
+      console.error("[classifier] error (ignored):", err);
+    }
+  }
+  const provider = PROVIDERS[decision.provider];
   const { project: modelProjectTag } = parseModelProjectTag(requestedModel);
   const project = resolveProject(
     c.req.header("x-router-project"),
@@ -351,7 +416,8 @@ app.post("/v1/chat/completions", async (c) => {
 
   const usage = emptyUsage();
 
-  /** Single place that writes the call to the DB. */
+  /** Single place that writes the call to the DB. The classifier's own
+   *  cost is folded into cost_usd so the dashboard reflects total spend. */
   const finalize = (status: number, error: string | null) => {
     try {
       recordCall({
@@ -364,7 +430,7 @@ app.post("/v1/chat/completions", async (c) => {
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens,
-        cost_usd: usage.cost_usd,
+        cost_usd: usage.cost_usd + llmCostUsd,
         duration_ms: Date.now() - startedAt,
         status,
         stream: isStream,
@@ -473,6 +539,15 @@ app.post("/v1/chat/completions", async (c) => {
             tier: actualTier,
             reason: decision.reason,
             fell_back: fellBackTo,
+            prompt_override: promptOverrideAlias,
+            classifier: llmDifficulty
+              ? {
+                  difficulty: llmDifficulty,
+                  duration_ms: llmDurationMs,
+                  cached: llmCached,
+                  cost_usd: llmCostUsd,
+                }
+              : null,
             project,
             work_type: workType,
           };

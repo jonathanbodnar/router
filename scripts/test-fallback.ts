@@ -22,6 +22,9 @@ const FAILING_MODELS = new Set<string>([
   "xiaomi/mimo-v2.5-pro",      // MiMo always 400s in this test
 ]);
 
+/** Record the last successful upstream call so tests can assert on it. */
+let lastUpstreamCall: { model: string; body: any } | null = null;
+
 const fake = createServer((req, res) => {
   if (req.url !== "/api/v1/chat/completions" || req.method !== "POST") {
     res.statusCode = 404; res.end("nope"); return;
@@ -30,6 +33,7 @@ const fake = createServer((req, res) => {
   req.on("end", () => {
     let parsed: any; try { parsed = JSON.parse(body); } catch { parsed = {}; }
     const model: string = parsed.model ?? "unknown";
+    lastUpstreamCall = { model, body: parsed };
 
     if (FAILING_MODELS.has(model)) {
       const status = model.includes("opus") ? 500 : 400;
@@ -73,11 +77,14 @@ child.stdout.on("data", (d) => process.stdout.write(`[router] ${d}`));
 child.stderr.on("data", (d) => process.stderr.write(`[router-err] ${d}`));
 await sleep(700);
 
-async function call(model: string): Promise<{ status: number; body: any }> {
+async function call(
+  model: string,
+  userContent = "hi",
+): Promise<{ status: number; body: any }> {
   const res = await fetch(`http://127.0.0.1:${ROUTER_PORT}/v1/chat/completions`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${ROUTER_KEY}` },
-    body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
+    body: JSON.stringify({ model, messages: [{ role: "user", content: userContent }] }),
   });
   return { status: res.status, body: await res.json() };
 }
@@ -112,6 +119,34 @@ FAILING_MODELS.add("anthropic/claude-sonnet-4.6");
 const r4 = await call("code");
 expect("client gets 4xx since code itself fails", r4.status >= 400);
 FAILING_MODELS.delete("anthropic/claude-sonnet-4.6");
+
+console.log("\n=== test 5: !alias prompt override is parsed end-to-end ===");
+// User has gpt-4.1 set in Cursor, but starts a message with `!cheap`.
+// Router should: route to deepseek, strip the `!cheap` from the prompt
+// before forwarding, and report the override in _router metadata.
+lastUpstreamCall = null;
+const r5 = await call("gpt-4.1", "!cheap quick: what does this regex do?");
+expect("client gets 200", r5.status === 200, `status=${r5.status}`);
+expect(
+  "routed to deepseek via override",
+  r5.body?._router?.routed_to?.includes("deepseek-v4-pro") === true,
+  `routed_to=${r5.body?._router?.routed_to}`,
+);
+expect(
+  "_router.prompt_override recorded",
+  r5.body?._router?.prompt_override === "cheap",
+  `prompt_override=${r5.body?._router?.prompt_override}`,
+);
+expect(
+  "tag stripped from forwarded message",
+  lastUpstreamCall?.body?.messages?.[0]?.content === "quick: what does this regex do?",
+  `forwarded=${JSON.stringify(lastUpstreamCall?.body?.messages?.[0]?.content)}`,
+);
+expect(
+  "response.model echoes original requested model",
+  r5.body?.model === "gpt-4.1",
+  `model=${r5.body?.model}`,
+);
 
 /* ---------- shutdown ---------- */
 
