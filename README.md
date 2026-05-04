@@ -226,10 +226,12 @@ From here on, Cursor sends every request to your Railway service, which:
 - `src/pricing.ts` &mdash; per-model price table for providers that don't return cost (Fireworks).
 - `src/classify.ts` &mdash; project + work-type detection, plus the `!alias` in-prompt override parser.
 - `src/llm-classifier.ts` &mdash; hybrid LLM classifier (uncertain-band only, with timeout + cache).
+- `src/breaker.ts` &mdash; in-process circuit breaker for flapping upstream models (skips primary, goes to fallback).
 - `src/db.ts` &mdash; SQLite schema, `recordCall`, dashboard queries.
 - `src/dashboard.ts` &mdash; HTML dashboard + JSON stats API + Basic-auth gate.
 - `scripts/test-router.ts` &mdash; offline sanity checks for the heuristic classifier.
 - `scripts/test-classifier.ts` &mdash; unit tests for prompt overrides + hybrid LLM classifier (mocked).
+- `scripts/test-breaker.ts` &mdash; unit tests for the circuit breaker.
 - `scripts/test-fallback.ts` &mdash; end-to-end test for upstream-failure fallback + prompt overrides.
 - `scripts/test-normalise.ts` &mdash; unit tests for body-shape normalisation.
 - `scripts/smoke.ts` &mdash; offline DB / classifier smoke test.

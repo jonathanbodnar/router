@@ -1,4 +1,5 @@
 import type { Context, Hono } from "hono";
+import { snapshot as breakerSnapshot } from "./breaker.js";
 import {
   byModel,
   byProject,
@@ -77,6 +78,7 @@ export function mountDashboard(app: Hono): void {
       by_model: byModel(period),
       by_project: byProject(period),
       by_work_type: byWorkType(period),
+      breaker: breakerSnapshot(),
       recent: recent(period, 100),
       generated_at: Math.floor(Date.now() / 1000),
     });
@@ -160,6 +162,10 @@ const DASHBOARD_HTML = `<!doctype html>
   .muted { color: var(--muted); }
   .row { display: flex; align-items: center; gap: 8px; }
   .err { color: var(--bad); }
+  tr.errrow td {
+    background: #1a1112; border-top: 0; padding: 6px 10px 12px;
+    white-space: pre-wrap; word-break: break-word; font-size: 11px; line-height: 1.45;
+  }
   section + section { margin-top: 24px; }
   code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
   .empty { color: var(--muted); padding: 24px; text-align: center; }
@@ -191,6 +197,10 @@ const DASHBOARD_HTML = `<!doctype html>
       <code>X-Router-Project</code> header. Work type is heuristic on the last
       user message; override with <code>X-Router-Work-Type</code>.
     </div></div>
+  </section>
+  <section class="card" id="breaker_card" style="display:none">
+    <h2>Circuit breaker</h2>
+    <div id="breaker"></div>
   </section>
   <section class="card">
     <h2>Recent calls</h2>
@@ -252,19 +262,29 @@ const DASHBOARD_HTML = `<!doctype html>
     return \`<table><thead><tr><th>Type</th><th class="num">Calls</th><th class="num">Tokens</th><th class="num">Cost</th></tr></thead><tbody>\${body}</tbody></table>\`;
   }
 
+  function escapeHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    })[c]);
+  }
+
   function recentTable(rows) {
     if (!rows.length) return '<div class="empty">no data yet</div>';
-    const body = rows.map(r => \`<tr>
-      <td class="mono muted">\${fmtTime(r.ts)}</td>
-      <td>\${r.project ? '<code>' + r.project + '</code>' : '<span class="muted">—</span>'}</td>
-      <td><span class="pill \${r.work_type}">\${r.work_type}</span></td>
-      <td class="mono">\${r.routed_model}</td>
-      <td class="num">\${fmtInt(r.prompt_tokens)}</td>
-      <td class="num">\${fmtInt(r.completion_tokens)}</td>
-      <td class="num">\${fmtMoney(r.cost_usd)}</td>
-      <td class="num muted">\${fmtDur(r.duration_ms)}</td>
-      <td class="num \${r.status >= 400 ? 'err' : 'muted'}">\${r.status}</td>
-    </tr>\`).join("");
+    const body = rows.map(r => {
+      const main = \`<tr>
+        <td class="mono muted">\${fmtTime(r.ts)}</td>
+        <td>\${r.project ? '<code>' + r.project + '</code>' : '<span class="muted">—</span>'}</td>
+        <td><span class="pill \${r.work_type}">\${r.work_type}</span></td>
+        <td class="mono">\${escapeHtml(r.routed_model)}</td>
+        <td class="num">\${fmtInt(r.prompt_tokens)}</td>
+        <td class="num">\${fmtInt(r.completion_tokens)}</td>
+        <td class="num">\${fmtMoney(r.cost_usd)}</td>
+        <td class="num muted">\${fmtDur(r.duration_ms)}</td>
+        <td class="num \${r.status >= 400 ? 'err' : 'muted'}">\${r.status}</td>
+      </tr>\`;
+      if (!r.error) return main;
+      return main + \`<tr class="errrow"><td colspan="9" class="mono err">\${escapeHtml(r.error)}</td></tr>\`;
+    }).join("");
     return \`<table><thead><tr>
       <th>Time</th><th>Project</th><th>Type</th><th>Model</th>
       <th class="num">In</th><th class="num">Out</th><th class="num">Cost</th>
@@ -291,6 +311,21 @@ const DASHBOARD_HTML = `<!doctype html>
     $("by_work_type").innerHTML   = workTypeTable(data.by_work_type);
     $("recent").innerHTML         = recentTable(data.recent);
     $("updated").textContent      = "updated " + new Date(data.generated_at * 1000).toLocaleTimeString();
+
+    const breaker = (data.breaker || []).filter(b => b.consecutiveFails > 0 || b.openMsRemaining > 0);
+    if (breaker.length) {
+      $("breaker_card").style.display = "";
+      $("breaker").innerHTML = \`<table><thead><tr>
+        <th>Model</th><th class="num">Recent fails</th><th class="num">Open for</th><th>State</th>
+      </tr></thead><tbody>\${breaker.map(b => \`<tr>
+        <td class="mono">\${escapeHtml(b.model)}</td>
+        <td class="num">\${fmtInt(b.consecutiveFails)}</td>
+        <td class="num \${b.openMsRemaining > 0 ? 'err' : 'muted'}">\${b.openMsRemaining > 0 ? fmtDur(b.openMsRemaining) : '-'}</td>
+        <td class="\${b.openMsRemaining > 0 ? 'err' : 'muted'}">\${b.openMsRemaining > 0 ? 'OPEN — skipping to fallback' : 'cooling'}</td>
+      </tr>\`).join("")}</tbody></table>\`;
+    } else {
+      $("breaker_card").style.display = "none";
+    }
   }
 
   document.querySelectorAll("#period-seg button").forEach(b => {

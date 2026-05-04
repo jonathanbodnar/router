@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import * as breaker from "./breaker.js";
 import {
   parseModelProjectTag,
   parsePromptOverride,
@@ -445,46 +446,93 @@ app.post("/v1/chat/completions", async (c) => {
    * Try the routed (provider, model). If upstream returns a non-OK status
    * AND we weren't already on the code tier (Sonnet), retry once on
    * Sonnet — it's the most reliable target for OpenAI-shaped tool calls.
+   *
+   * Before the primary call we also consult a tiny in-process circuit
+   * breaker (`src/breaker.ts`): if the primary model has tripped recently,
+   * we skip it entirely and go straight to the fallback, so a flapping
+   * upstream doesn't pile up 5xx responses that trip Cursor's BYOK proxy
+   * rate-limiter.
+   *
    * Returns the (final) Response, with body never consumed.
    */
   const callUpstreamWithFallback = async (): Promise<Response> => {
+    const fallbackEntry = MODELS.code;
+    const fallbackProvider = PROVIDERS[fallbackEntry.provider];
+    const tryFallback = async (
+      reasonForFallback: string,
+    ): Promise<Response> => {
+      const fb = buildUpstreamRequest(fallbackProvider, fallbackEntry.model);
+      let fbResp: Response;
+      try {
+        fbResp = await fetch(fb.url, fb.init);
+      } catch (err) {
+        console.error(`[upstream:${fallbackProvider.name}] fallback fetch failed:`, err);
+        breaker.record(fallbackEntry.model, false);
+        throw err;
+      }
+      actualProvider = fallbackProvider;
+      actualModel = fallbackEntry.model;
+      actualTier = "code";
+      fellBackTo = `${fallbackProvider.name}:${fallbackEntry.model} (${reasonForFallback})`;
+      breaker.record(fallbackEntry.model, fbResp.ok);
+      return fbResp;
+    };
+
+    // 0. Breaker open on primary -> skip it and go straight to fallback.
+    if (
+      decision.tier !== "code" &&
+      decision.model !== fallbackEntry.model &&
+      breaker.isOpen(decision.model)
+    ) {
+      console.warn(
+        `[breaker-open] skipping ${provider.name}:${decision.model}, ` +
+          `going straight to ${fallbackProvider.name}:${fallbackEntry.model}`,
+      );
+      return tryFallback("breaker-open");
+    }
+
+    // 1. Try the primary.
     const primary = buildUpstreamRequest(provider, decision.model);
     let resp: Response;
     try {
       resp = await fetch(primary.url, primary.init);
     } catch (err) {
       console.error(`[upstream:${provider.name}] fetch failed:`, err);
+      breaker.record(decision.model, false);
       throw err;
     }
+    breaker.record(decision.model, resp.ok);
     // Don't retry the code tier itself, and don't retry on success.
     if (resp.ok || decision.tier === "code") return resp;
 
-    // Snapshot the upstream error body for the logs, then retry on Sonnet.
+    // 2. Primary failed -> snapshot error body, retry on Sonnet.
     let primaryBody = "";
     try { primaryBody = await resp.text(); } catch { /* ignore */ }
     console.warn(
       `[fallback] ${provider.name}:${decision.model} -> ${resp.status} ` +
         `body=${primaryBody.slice(0, 400)} ; retrying on code tier (Sonnet)`,
     );
-    const fallbackEntry = MODELS.code;
-    const fallbackProvider = PROVIDERS[fallbackEntry.provider];
-    const fallback = buildUpstreamRequest(fallbackProvider, fallbackEntry.model);
     let fallbackResp: Response;
     try {
-      fallbackResp = await fetch(fallback.url, fallback.init);
-    } catch (err) {
-      console.error(`[upstream:${fallbackProvider.name}] fallback fetch failed:`, err);
-      // Re-throw the original surface for the client.
+      fallbackResp = await tryFallback(`primary-${resp.status}`);
+    } catch {
+      // Network error on fallback — surface the primary error.
       return new Response(primaryBody, { status: resp.status, headers: resp.headers });
     }
-    if (fallbackResp.ok) {
-      actualProvider = fallbackProvider;
-      actualModel = fallbackEntry.model;
-      actualTier = "code";
-      fellBackTo = `${fallbackProvider.name}:${fallbackEntry.model}`;
-      return fallbackResp;
-    }
-    // Both failed; surface the fallback's error since it's the more recent.
+    if (fallbackResp.ok) return fallbackResp;
+    // Both failed. Surface the fallback's error since it's the more recent;
+    // log a structured one-liner for debugging both legs in one place.
+    let fallbackBodyPreview = "";
+    try {
+      fallbackBodyPreview = (await fallbackResp.clone().text()).slice(0, 400);
+    } catch { /* ignore */ }
+    console.warn(
+      `[fallback-failed] both legs failed: ` +
+        `primary=${provider.name}:${decision.model}(${resp.status}) ` +
+        `fallback=${fallbackProvider.name}:${fallbackEntry.model}(${fallbackResp.status}) ` +
+        `primary_body=${primaryBody.slice(0, 200)} ` +
+        `fallback_body=${fallbackBodyPreview}`,
+    );
     return fallbackResp;
   };
 
