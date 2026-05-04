@@ -60,7 +60,7 @@ cleanEnv();
   );
 }
 
-console.log("\n=== classifyEffort: agentic tier — medium effort ===\n");
+console.log("\n=== classifyEffort: agentic tier — always low (Cursor timeout constraint) ===\n");
 
 {
   const msg =
@@ -68,51 +68,36 @@ console.log("\n=== classifyEffort: agentic tier — medium effort ===\n");
     "can you debug this and figure out why the state reset is happening " +
     "before the redirect completes? I think it might be a race condition.";
   expect(
-    "bug fix description = medium",
-    classifyEffort(msg, 5, "agentic") === "medium",
+    "bug fix description = low (forced for Cursor compat)",
+    classifyEffort(msg, 5, "agentic") === "low",
     `tokens≈${Math.ceil(msg.length / 4)}`,
   );
 }
-
-console.log("\n=== classifyEffort: agentic tier — high effort ===\n");
-
 {
   expect(
-    "build a new component = high",
-    classifyEffort("build a new settings page with dark mode toggle", 5, "agentic") === "high",
+    "build a new component = low (forced for Cursor compat)",
+    classifyEffort("build a new settings page with dark mode toggle", 5, "agentic") === "low",
   );
 }
 {
   expect(
-    "create a new API endpoint = high",
-    classifyEffort("create a new REST endpoint for user preferences", 4, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "from scratch = high",
-    classifyEffort("write the auth middleware from scratch", 2, "agentic") === "high",
+    "create a new API endpoint = low (forced for Cursor compat)",
+    classifyEffort("create a new REST endpoint for user preferences", 4, "agentic") === "low",
   );
 }
 
-console.log("\n=== classifyEffort: agent mode (tools >= 10) ===\n");
+console.log("\n=== classifyEffort: agent mode (tools >= 10) — still low ===\n");
 
 {
   expect(
-    "agent mode: short turn = medium (floor)",
-    classifyEffort("here is the file content", 19, "agentic") === "medium",
+    "agent mode: short turn = low (forced for Cursor compat)",
+    classifyEffort("here is the file content", 19, "agentic") === "low",
   );
 }
 {
   expect(
-    "agent mode: build signal = high",
-    classifyEffort("build a new REST endpoint for user preferences", 19, "agentic") === "high",
-  );
-}
-{
-  expect(
-    "agent mode: generic mid-task = medium",
-    classifyEffort("Now I'll update ShowKPIPage.tsx", 19, "agentic") === "medium",
+    "agent mode: build signal = low (forced for Cursor compat)",
+    classifyEffort("build a new REST endpoint for user preferences", 19, "agentic") === "low",
   );
 }
 
@@ -146,11 +131,11 @@ cleanEnv();
   const out = withReasoningEffort(
     { model: "xiaomi/mimo-v2.5-pro" },
     "xiaomi/mimo-v2.5-pro",
-    "medium",
-  ) as { reasoning?: { effort?: string } };
+    "low",
+  ) as { reasoning?: { effort?: string; max_tokens?: number } };
   expect(
-    "MiMo gets dynamic medium effort",
-    out.reasoning?.effort === "medium",
+    "MiMo gets low effort + max_tokens cap",
+    out.reasoning?.effort === "low" && out.reasoning?.max_tokens === 64,
     `reasoning=${JSON.stringify(out.reasoning)}`,
   );
 }

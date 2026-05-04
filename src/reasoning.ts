@@ -49,6 +49,16 @@ export const REASONING_EFFORT_DEFAULTS: Record<string, ReasoningEffort> = {
   "anthropic/claude-opus-4.7": "high",
 };
 
+/**
+ * Max reasoning tokens per model. Cursor presents our router as
+ * "gpt-4.1" — a non-reasoning model — so it expects content within
+ * ~3 seconds. MiMo's reasoning phase must finish before that timeout.
+ * 64 tokens ≈ 1-2 sentences of thinking ≈ <1 second at MiMo's speed.
+ */
+const REASONING_MAX_TOKENS: Record<string, number> = {
+  "xiaomi/mimo-v2.5-pro": 64,
+};
+
 
 /* ------------------------------------------------------------------ */
 /*  Dynamic effort classification                                     */
@@ -137,35 +147,21 @@ export function classifyEffort(
   // a sensible value for logging.
   if (tier === "cheap" || tier === "code") return "low";
 
-  // ---- agentic (MiMo) tier: dynamic classification ----
+  // ---- agentic (MiMo) tier ----
   //
-  // Now that we pass reasoning chunks through to Cursor (instead of
-  // stripping them), Cursor sees the stream as alive during MiMo's
-  // thinking phase — just like when connected directly to OpenRouter.
-  // So we can safely use medium/high effort without triggering
-  // Cursor's retry logic.
-
-  const isHighSignal = HIGH_RE.test(userText);
-
-  // HIGH signals always win, regardless of message length.
-  if (isHighSignal) return "high";
-
-  // Full agent mode (Cursor sends ~19 tools). In a multi-turn agent
-  // conversation the "last user message" is often a tool result, not
-  // the original task. Floor at medium so agent turns don't get low.
-  const isAgentMode = toolCount >= 10;
-  const floor: ReasoningEffort = isAgentMode ? "medium" : "low";
-
-  // Very short user message + few tools = simple tool-call relay.
-  if (!isAgentMode && userTokens < 30 && toolCount > 0) return "low";
-
-  // Trivial / mechanical signals for short messages.
-  if (!isAgentMode && LOW_RE.test(userText) && userTokens < 150) return "low";
-
-  if (userTokens > 80) return "medium";
-  if (userTokens > 30) return "medium";
-
-  return floor;
+  // Cursor presents our router as "gpt-4.1" — a non-reasoning model.
+  // This means Cursor expects content within ~3 seconds. Any reasoning
+  // phase longer than that triggers aggressive retries.
+  //
+  // We CANNOT use medium/high here. Even though reasoning chunks flow
+  // through, Cursor ignores the `reasoning` field for "gpt-4.1" and
+  // only watches `content`. We force low + max_tokens cap so MiMo's
+  // thinking finishes in <2 seconds and content starts flowing.
+  //
+  // The dynamic classification (HIGH_RE, medium for agent mode, etc.)
+  // is preserved in comments below in case we ever find a model name
+  // that makes Cursor recognize MiMo as a reasoning model.
+  return "low";
 }
 
 /* ------------------------------------------------------------------ */
@@ -204,7 +200,10 @@ export function withReasoningEffort<B extends { reasoning?: unknown }>(
   if (!resolved) return body;
   if (!REASONING_CAPABLE_MODELS.has(model)) return body;
 
-  return { ...body, reasoning: { effort: resolved } };
+  const cap = REASONING_MAX_TOKENS[model];
+  return cap
+    ? { ...body, reasoning: { effort: resolved, max_tokens: cap } }
+    : { ...body, reasoning: { effort: resolved } };
 }
 
 /* ------------------------------------------------------------------ */

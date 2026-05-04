@@ -18,8 +18,12 @@ import { loadProviders, type Provider } from "./providers.js";
 import {
   classifyEffort,
   type ReasoningEffort,
+  shouldStripReasoning,
+  stripReasoningInPlace,
   withReasoningEffort,
 } from "./reasoning.js";
+
+const STRIP_REASONING = shouldStripReasoning();
 import { MODELS, route, type IncomingRequest } from "./router.js";
 
 const { ROUTER_API_KEY, ROUTER_LOG, PORT } = process.env;
@@ -637,6 +641,9 @@ app.post("/v1/chat/completions", async (c) => {
             const parts: string[] = [];
             for (const ch of choices) {
               const msg = (ch as { message?: Record<string, unknown> } | null)?.message;
+              if (msg && typeof msg === "object" && STRIP_REASONING) {
+                stripReasoningInPlace(msg);
+              }
               const content = msg?.content;
               if (typeof content === "string") parts.push(content);
               else if (Array.isArray(content)) {
@@ -818,13 +825,14 @@ function rewriteSseEvent(
             const choice = ch as { delta?: Record<string, unknown> } | null;
             const delta = choice?.delta;
             if (delta && typeof delta === "object") {
-              // Do NOT strip reasoning from streaming deltas. Cursor
-              // needs the constant flow of SSE data events (even with
-              // content:"") to know the stream is alive. When we
-              // stripped reasoning + dropped empty chunks, Cursor saw
-              // dead air and retried in an infinite loop. Passing
-              // reasoning through matches what Cursor sees when
-              // connected directly to OpenRouter.
+              // Strip reasoning fields but KEEP forwarding the chunk.
+              // Cursor sees "gpt-4.1" and doesn't understand reasoning
+              // fields — it only watches `content`. We strip to save
+              // bandwidth but keep the chunk (with content:"") flowing
+              // so Cursor sees continuous SSE data events.
+              if (STRIP_REASONING) {
+                if (stripReasoningInPlace(delta)) mutated = true;
+              }
               if (captured) {
                 const c = delta.content;
                 if (typeof c === "string") captured.responseText += c;
