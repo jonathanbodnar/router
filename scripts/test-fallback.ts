@@ -113,12 +113,29 @@ expect("client gets 200", r3.status === 200);
 expect("served by deepseek", r3.body?._router?.routed_to?.includes("deepseek-v4-pro") === true);
 expect("no fall_back", r3.body?._router?.fell_back == null);
 
-console.log("\n=== test 4: code -> succeeds; no recursive retry on its own failure ===");
-// Make Sonnet ALSO fail — should propagate the error rather than loop.
+console.log("\n=== test 4: code+mimo both fail -> chain falls through to deepseek ===");
+// Make Sonnet AND MiMo fail. Chain should walk all the way to DeepSeek
+// (which is on a different provider entirely) so the client still gets 200
+// and Cursor's BYOK rate-limiter doesn't trip.
 FAILING_MODELS.add("anthropic/claude-sonnet-4.6");
 const r4 = await call("code");
-expect("client gets 4xx since code itself fails", r4.status >= 400);
+expect("client gets 200 (via chain to deepseek)", r4.status === 200, `status=${r4.status}`);
+expect(
+  "served by deepseek as last resort",
+  r4.body?._router?.routed_to?.includes("deepseek-v4-pro") === true,
+  `routed_to=${r4.body?._router?.routed_to}`,
+);
 FAILING_MODELS.delete("anthropic/claude-sonnet-4.6");
+
+console.log("\n=== test 4b: every tier fails -> last upstream error returned ===");
+FAILING_MODELS.add("anthropic/claude-sonnet-4.6");
+FAILING_MODELS.add("xiaomi/mimo-v2.5-pro");
+FAILING_MODELS.add("accounts/fireworks/models/deepseek-v4-pro");
+const r4b = await call("code");
+expect("everything fails -> 4xx", r4b.status >= 400, `status=${r4b.status}`);
+FAILING_MODELS.delete("anthropic/claude-sonnet-4.6");
+FAILING_MODELS.delete("xiaomi/mimo-v2.5-pro");
+FAILING_MODELS.delete("accounts/fireworks/models/deepseek-v4-pro");
 
 console.log("\n=== test 5: !alias prompt override is parsed end-to-end ===");
 // User has gpt-4.1 set in Cursor, but starts a message with `!cheap`.

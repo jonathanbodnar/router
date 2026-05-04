@@ -352,32 +352,26 @@ app.post("/v1/chat/completions", async (c) => {
   }
 
   /**
-   * Headers we NEVER forward from the client to upstream — anything that
-   * would either be wrong (Host, Content-Length), a duplicate of what we
-   * set ourselves (Authorization, Content-Type), a transport concern
-   * (Connection, Transfer-Encoding, Accept-Encoding), or part of our own
-   * namespace (X-Router-*).
+   * Headers we DO forward from the client to upstream. We use a strict
+   * allowlist (rather than a denylist) because forwarding anything Cursor
+   * happens to send was causing OpenRouter's edge to reject the request
+   * with a generic "Internal Server Error" 500 for Anthropic models.
+   *
+   * The kept ones are SDK-identification headers that OpenRouter's
+   * model-specific adapters (notably MiMo's tool-translation layer) use
+   * to apply the right OpenAI-compat shim. Anything else — Cursor-specific
+   * headers, CDN/Cloudflare beacons, Accept-Encoding, etc. — is dropped.
    */
-  const STRIPPED = new Set([
-    "authorization",
-    "host",
-    "content-length",
-    "content-type",
-    "cookie",
-    "set-cookie",
-    "connection",
-    "transfer-encoding",
-    "accept-encoding",
+  const HEADER_ALLOW_EXACT = new Set([
+    "user-agent",
+    "openai-beta",
+    "openai-organization",
+    "openai-project",
   ]);
+  const HEADER_ALLOW_PREFIXES = ["x-stainless-"];
 
   /**
    * Build the request to send upstream for a given (provider, model) pair.
-   * We deliberately forward most client headers (User-Agent, OpenAI-Beta,
-   * X-Stainless-*, etc.) so upstream can apply the same client-aware
-   * compatibility behaviour it does when the client talks to it directly
-   * — without those headers, e.g. OpenRouter's adapter for Xiaomi/MiMo
-   * doesn't translate OpenAI-shaped tool definitions, and Xiaomi rejects
-   * the request with "Param Incorrect, param: function is not set".
    */
   const buildUpstreamRequest = (
     p: typeof provider,
@@ -389,9 +383,12 @@ app.post("/v1/chat/completions", async (c) => {
     const headers: Record<string, string> = {};
     c.req.raw.headers.forEach((value, name) => {
       const lower = name.toLowerCase();
-      if (STRIPPED.has(lower)) return;
-      if (lower.startsWith("x-router-")) return;
-      headers[name] = value;
+      if (
+        HEADER_ALLOW_EXACT.has(lower) ||
+        HEADER_ALLOW_PREFIXES.some((prefix) => lower.startsWith(prefix))
+      ) {
+        headers[name] = value;
+      }
     });
     // Our overrides go last so they win over anything the client sent.
     headers["content-type"] = "application/json";
@@ -455,117 +452,120 @@ app.post("/v1/chat/completions", async (c) => {
   };
 
   /**
-   * Try the routed (provider, model). If upstream returns a non-OK status
-   * AND we weren't already on the code tier (Sonnet), retry once on
-   * Sonnet — it's the most reliable target for OpenAI-shaped tool calls.
+   * Try the routed (provider, model). On non-OK upstream, walk a fallback
+   * chain so we always land somewhere healthy:
    *
-   * Before the primary call we also consult a tiny in-process circuit
-   * breaker (`src/breaker.ts`): if the primary model has tripped recently,
-   * we skip it entirely and go straight to the fallback, so a flapping
-   * upstream doesn't pile up 5xx responses that trip Cursor's BYOK proxy
-   * rate-limiter.
+   *   reasoning -> code -> agentic -> cheap
+   *
+   * Each step is skipped when its model's circuit breaker is open. We
+   * always end at `cheap` (DeepSeek on Fireworks) which is on a separate
+   * provider, so even a full OpenRouter outage still gets the user a
+   * response and Cursor's BYOK proxy won't trip its local rate-limiter.
    *
    * Returns the (final) Response, with body never consumed.
    */
   const callUpstreamWithFallback = async (): Promise<Response> => {
-    const fallbackEntry = MODELS.code;
-    const fallbackProvider = PROVIDERS[fallbackEntry.provider];
-    const tryFallback = async (
-      reasonForFallback: string,
-    ): Promise<Response> => {
-      const fb = buildUpstreamRequest(fallbackProvider, fallbackEntry.model);
-      let fbResp: Response;
-      try {
-        fbResp = await fetch(fb.url, fb.init);
-      } catch (err) {
-        console.error(`[upstream:${fallbackProvider.name}] fallback fetch failed:`, err);
-        breaker.record(fallbackEntry.model, false);
-        throw err;
+    // Priority list of (tier, model, provider) to try. We always try the
+    // routed model first; on failure we try Sonnet (the most reliable
+    // OpenAI-shaped tool-calling target on OpenRouter); and finally
+    // DeepSeek-on-Fireworks as a hard last resort because it's on a
+    // completely separate provider from OR — even a full OR outage still
+    // gets the user a response so Cursor's BYOK proxy doesn't trip.
+    const candidates: Array<{
+      tier: typeof decision.tier;
+      model: string;
+      providerCfg: typeof provider;
+      label: "primary" | "fallback-sonnet" | "fallback-deepseek";
+    }> = [];
+    const seen = new Set<string>();
+    const push = (
+      tier: typeof decision.tier,
+      label: "primary" | "fallback-sonnet" | "fallback-deepseek",
+    ) => {
+      const entry = MODELS[tier];
+      if (seen.has(entry.model)) return;
+      seen.add(entry.model);
+      candidates.push({
+        tier,
+        model: entry.model,
+        providerCfg: PROVIDERS[entry.provider],
+        label,
+      });
+    };
+    push(decision.tier, "primary");
+    push("code", "fallback-sonnet");
+    push("cheap", "fallback-deepseek");
+
+    let lastResp: Response | null = null;
+    let lastBodyPreview = "";
+
+    for (let i = 0; i < candidates.length; i++) {
+      const cand = candidates[i]!;
+      const isLast = i === candidates.length - 1;
+      // Skip candidates whose breaker is open — but never skip the last
+      // one (we always need to attempt at least the final fallback).
+      if (!isLast && breaker.isOpen(cand.model)) {
+        console.warn(
+          `[breaker-open] skipping ${cand.providerCfg.name}:${cand.model} (${cand.label})`,
+        );
+        continue;
       }
-      actualProvider = fallbackProvider;
-      actualModel = fallbackEntry.model;
-      actualTier = "code";
-      fellBackTo = `${fallbackProvider.name}:${fallbackEntry.model} (${reasonForFallback})`;
-      breaker.record(fallbackEntry.model, fbResp.ok);
+
+      const reqOut = buildUpstreamRequest(cand.providerCfg, cand.model);
+      let resp: Response;
+      try {
+        resp = await fetch(reqOut.url, reqOut.init);
+      } catch (err) {
+        console.error(`[upstream:${cand.providerCfg.name}] fetch failed:`, err);
+        breaker.record(cand.model, false);
+        lastBodyPreview = String(err);
+        continue;
+      }
+      breaker.record(cand.model, resp.ok);
+
+      let bodyPreview = "";
       if (process.env.ROUTER_LOG_UPSTREAM === "1") {
-        const cloned = fbResp.clone();
         try {
-          const body = (await cloned.text()).slice(0, 2000);
+          bodyPreview = (await resp.clone().text()).slice(0, 2000);
           console.log(
-            `[upstream-in] ${fallbackProvider.name}:${fallbackEntry.model} ` +
-              `status=${fbResp.status} body=${body}`,
+            `[upstream-in] ${cand.providerCfg.name}:${cand.model} ` +
+              `status=${resp.status} body=${bodyPreview}`,
           );
         } catch { /* ignore */ }
       }
-      return fbResp;
-    };
 
-    // 0. Breaker open on primary -> skip it and go straight to fallback.
-    if (
-      decision.tier !== "code" &&
-      decision.model !== fallbackEntry.model &&
-      breaker.isOpen(decision.model)
-    ) {
+      // Update "what we actually called" so logs / DB / response metadata
+      // reflect reality.
+      actualProvider = cand.providerCfg;
+      actualModel = cand.model;
+      actualTier = cand.tier;
+      if (cand.label !== "primary") {
+        fellBackTo = `${cand.providerCfg.name}:${cand.model} (${cand.label})`;
+      }
+
+      if (resp.ok) return resp;
+
+      // Non-OK: snapshot body, log a one-liner, continue walking.
+      let bodyText = bodyPreview;
+      if (!bodyText) {
+        try { bodyText = (await resp.clone().text()).slice(0, 2000); } catch { /* ignore */ }
+      }
       console.warn(
-        `[breaker-open] skipping ${provider.name}:${decision.model}, ` +
-          `going straight to ${fallbackProvider.name}:${fallbackEntry.model}`,
+        `[fallback] ${cand.providerCfg.name}:${cand.model} (${cand.label}) -> ` +
+          `${resp.status} body=${bodyText.slice(0, 400)}`,
       );
-      return tryFallback("breaker-open");
+      lastResp = resp;
+      lastBodyPreview = bodyText;
     }
 
-    // 1. Try the primary.
-    const primary = buildUpstreamRequest(provider, decision.model);
-    let resp: Response;
-    try {
-      resp = await fetch(primary.url, primary.init);
-    } catch (err) {
-      console.error(`[upstream:${provider.name}] fetch failed:`, err);
-      breaker.record(decision.model, false);
-      throw err;
+    if (lastResp) {
+      console.warn(
+        `[fallback-exhausted] every tier failed for this request; ` +
+          `last_status=${lastResp.status} last_body=${lastBodyPreview.slice(0, 200)}`,
+      );
+      return lastResp;
     }
-    breaker.record(decision.model, resp.ok);
-    if (process.env.ROUTER_LOG_UPSTREAM === "1") {
-      const cloned = resp.clone();
-      try {
-        const body = (await cloned.text()).slice(0, 2000);
-        console.log(
-          `[upstream-in] ${provider.name}:${decision.model} ` +
-            `status=${resp.status} body=${body}`,
-        );
-      } catch { /* ignore */ }
-    }
-    // Don't retry the code tier itself, and don't retry on success.
-    if (resp.ok || decision.tier === "code") return resp;
-
-    // 2. Primary failed -> snapshot error body, retry on Sonnet.
-    let primaryBody = "";
-    try { primaryBody = await resp.text(); } catch { /* ignore */ }
-    console.warn(
-      `[fallback] ${provider.name}:${decision.model} -> ${resp.status} ` +
-        `body=${primaryBody.slice(0, 400)} ; retrying on code tier (Sonnet)`,
-    );
-    let fallbackResp: Response;
-    try {
-      fallbackResp = await tryFallback(`primary-${resp.status}`);
-    } catch {
-      // Network error on fallback — surface the primary error.
-      return new Response(primaryBody, { status: resp.status, headers: resp.headers });
-    }
-    if (fallbackResp.ok) return fallbackResp;
-    // Both failed. Surface the fallback's error since it's the more recent;
-    // log a structured one-liner for debugging both legs in one place.
-    let fallbackBodyPreview = "";
-    try {
-      fallbackBodyPreview = (await fallbackResp.clone().text()).slice(0, 400);
-    } catch { /* ignore */ }
-    console.warn(
-      `[fallback-failed] both legs failed: ` +
-        `primary=${provider.name}:${decision.model}(${resp.status}) ` +
-        `fallback=${fallbackProvider.name}:${fallbackEntry.model}(${fallbackResp.status}) ` +
-        `primary_body=${primaryBody.slice(0, 200)} ` +
-        `fallback_body=${fallbackBodyPreview}`,
-    );
-    return fallbackResp;
+    throw new Error(`upstream chain exhausted: ${lastBodyPreview.slice(0, 200)}`);
   };
 
   let upstream: Response;
