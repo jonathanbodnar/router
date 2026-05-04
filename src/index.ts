@@ -17,6 +17,7 @@ import { computeCost } from "./pricing.js";
 import { loadProviders, type Provider } from "./providers.js";
 import {
   classifyEffort,
+  HEARTBEAT_MODELS,
   type ReasoningEffort,
   shouldStripReasoning,
   stripReasoningInPlace,
@@ -738,6 +739,17 @@ app.post("/v1/chat/completions", async (c) => {
     "x-accel-buffering": "no",
   });
 
+  // Heartbeat: for thinking models (MiMo) that produce reasoning
+  // tokens before content, inject synthetic " " content every ~2s
+  // so Cursor (which sees "gpt-4.1") doesn't timeout and retry.
+  const needsHeartbeat = HEARTBEAT_MODELS.has(actualModel);
+  const HEARTBEAT_MS = 2_000;
+
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  const clearHeartbeat = () => {
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  };
+
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const reader = upstream.body!.getReader();
@@ -750,6 +762,32 @@ app.post("/v1/chat/completions", async (c) => {
         recorded = true;
         finalize(status, err);
       };
+
+      let seenRealContent = false;
+
+      if (needsHeartbeat) {
+        heartbeatTimer = setInterval(() => {
+          if (seenRealContent) {
+            clearInterval(heartbeatTimer!);
+            heartbeatTimer = null;
+            return;
+          }
+          const hb = JSON.stringify({
+            id: `hb-${Date.now()}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: requestedModel,
+            choices: [{
+              index: 0,
+              delta: { role: "assistant", content: " " },
+              finish_reason: null,
+            }],
+          });
+          try {
+            controller.enqueue(encoder.encode(`data: ${hb}\n\n`));
+          } catch { /* stream already closed */ }
+        }, HEARTBEAT_MS);
+      }
 
       try {
         for (;;) {
@@ -767,9 +805,15 @@ app.post("/v1/chat/completions", async (c) => {
               usage,
               captured,
             );
+            if (!seenRealContent && rewritten.includes('"content":"') &&
+                !rewritten.includes('"content":""')) {
+              seenRealContent = true;
+              clearHeartbeat();
+            }
             controller.enqueue(encoder.encode(rewritten + "\n\n"));
           }
         }
+        clearHeartbeat();
         if (buffer.length > 0) {
           const rewritten = rewriteSseEvent(
             buffer,
@@ -782,6 +826,7 @@ app.post("/v1/chat/completions", async (c) => {
         finalizeCost(actualProvider.name, actualModel, usage);
         recordOnce(200, null);
       } catch (err) {
+        clearHeartbeat();
         console.error("[stream] error:", err);
         recordOnce(500, String(err));
         controller.error(err);
@@ -790,6 +835,7 @@ app.post("/v1/chat/completions", async (c) => {
       controller.close();
     },
     cancel(reason) {
+      clearHeartbeat();
       if (log) console.log("[stream] cancelled:", reason);
     },
   });
