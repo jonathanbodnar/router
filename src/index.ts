@@ -398,12 +398,24 @@ app.post("/v1/chat/completions", async (c) => {
     headers["authorization"] = `Bearer ${p.apiKey}`;
     for (const [k, v] of Object.entries(p.extraHeaders)) headers[k] = v;
 
+    const url = `${p.baseUrl}/chat/completions`;
+    const bodyJson = JSON.stringify(payload);
+    if (process.env.ROUTER_LOG_UPSTREAM === "1") {
+      const safeHeaders = { ...headers };
+      if (safeHeaders.authorization) {
+        safeHeaders.authorization = `Bearer ***${(p.apiKey ?? "").slice(-4)}`;
+      }
+      console.log(
+        `[upstream-out] ${p.name}:${model} ${url} ` +
+          `headers=${JSON.stringify(safeHeaders)} body=${bodyJson.slice(0, 4000)}`,
+      );
+    }
     return {
-      url: `${p.baseUrl}/chat/completions`,
+      url,
       init: {
         method: "POST",
         headers,
-        body: JSON.stringify(payload),
+        body: bodyJson,
       },
     };
   };
@@ -475,6 +487,16 @@ app.post("/v1/chat/completions", async (c) => {
       actualTier = "code";
       fellBackTo = `${fallbackProvider.name}:${fallbackEntry.model} (${reasonForFallback})`;
       breaker.record(fallbackEntry.model, fbResp.ok);
+      if (process.env.ROUTER_LOG_UPSTREAM === "1") {
+        const cloned = fbResp.clone();
+        try {
+          const body = (await cloned.text()).slice(0, 2000);
+          console.log(
+            `[upstream-in] ${fallbackProvider.name}:${fallbackEntry.model} ` +
+              `status=${fbResp.status} body=${body}`,
+          );
+        } catch { /* ignore */ }
+      }
       return fbResp;
     };
 
@@ -502,6 +524,16 @@ app.post("/v1/chat/completions", async (c) => {
       throw err;
     }
     breaker.record(decision.model, resp.ok);
+    if (process.env.ROUTER_LOG_UPSTREAM === "1") {
+      const cloned = resp.clone();
+      try {
+        const body = (await cloned.text()).slice(0, 2000);
+        console.log(
+          `[upstream-in] ${provider.name}:${decision.model} ` +
+            `status=${resp.status} body=${body}`,
+        );
+      } catch { /* ignore */ }
+    }
     // Don't retry the code tier itself, and don't retry on success.
     if (resp.ok || decision.tier === "code") return resp;
 
