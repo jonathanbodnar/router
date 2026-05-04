@@ -35,6 +35,35 @@ upgrades, never downgrades, has a hard timeout (default 1.5s), caches by
 content hash for 5 minutes so retries don't pay twice, and folds its own
 tiny cost into the call's `cost_usd`. Disable with `ROUTER_LLM_CLASSIFIER=0`.
 
+### Async quality judge (optional)
+
+To get visibility into where MiMo / DeepSeek are dropping quality vs a
+stronger model, you can enable the **async sampled judge**
+(`src/judge.ts`). After every successful cheap-tier call:
+
+1. Eligibility check (sync, in-process): tier is `cheap` or `agentic`,
+   completion was substantive (≥100 output tokens, contains code or is
+   meaningfully long), random dice roll passes the sample rate.
+2. If eligible, schedule a fire-and-forget Sonnet call (after the user
+   response has already been delivered — never blocks them) that rates
+   the response 1–10 against the user's actual ask, with a one-sentence
+   reason and a `would_be_better_with_sonnet` boolean.
+3. The score, reasons, and judge cost are saved to the DB and surface in
+   the dashboard:
+   - per-call **score badge** in the recent-calls table (red <6, yellow
+     6–7, green 8+),
+   - one-sentence judge reasoning shown inline under each judged call,
+   - aggregate **Quality** card (judged calls / avg score / Sonnet flags),
+   - **Low-quality calls** panel listing rows scored <6.
+
+Cost: a typical judge call is ~1.5k tokens in / 200 tokens out on Sonnet
+(~$0.007). At 100% sampling and 30 daily MiMo calls that's ~$0.20/day;
+at 25% sampling, ~$0.05/day. The judge's cost is added to that call's
+`cost_usd` so the dashboard reflects total spend.
+
+Off by default. Turn it on with `ROUTER_JUDGE=1`. See `.env.example`
+for sampling / threshold / model overrides.
+
 ### Picking the model from inside a prompt
 
 You don't have to switch the Cursor model dropdown to force a tier. Start
@@ -226,11 +255,14 @@ From here on, Cursor sends every request to your Railway service, which:
 - `src/pricing.ts` &mdash; per-model price table for providers that don't return cost (Fireworks).
 - `src/classify.ts` &mdash; project + work-type detection, plus the `!alias` in-prompt override parser.
 - `src/llm-classifier.ts` &mdash; hybrid LLM classifier (uncertain-band only, with timeout + cache).
+- `src/judge.ts` &mdash; async sampled quality judge that scores cheap-tier responses with Sonnet.
 - `src/breaker.ts` &mdash; in-process circuit breaker for flapping upstream models (skips primary, goes to fallback).
-- `src/db.ts` &mdash; SQLite schema, `recordCall`, dashboard queries.
+- `src/db.ts` &mdash; SQLite schema, `recordCall`, `updateQuality`, dashboard queries.
 - `src/dashboard.ts` &mdash; HTML dashboard + JSON stats API + Basic-auth gate.
+- `src/normalise.ts` &mdash; body-shape normalisation (Responses API ↔ Chat Completions, flat tools ↔ nested).
 - `scripts/test-router.ts` &mdash; offline sanity checks for the heuristic classifier.
 - `scripts/test-classifier.ts` &mdash; unit tests for prompt overrides + hybrid LLM classifier (mocked).
+- `scripts/test-judge.ts` &mdash; unit tests for the quality judge (mocked).
 - `scripts/test-breaker.ts` &mdash; unit tests for the circuit breaker.
 - `scripts/test-fallback.ts` &mdash; end-to-end test for upstream-failure fallback + prompt overrides.
 - `scripts/test-normalise.ts` &mdash; unit tests for body-shape normalisation.

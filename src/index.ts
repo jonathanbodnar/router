@@ -10,6 +10,7 @@ import {
 } from "./classify.js";
 import { mountDashboard } from "./dashboard.js";
 import { recordCall } from "./db.js";
+import { DEFAULT_CONFIG as JUDGE_CFG, scheduleJudge } from "./judge.js";
 import { DEFAULT_CONFIG as CLASSIFIER_CFG, maybeUpgradeWithLLM } from "./llm-classifier.js";
 import { normaliseBody } from "./normalise.js";
 import { computeCost } from "./pricing.js";
@@ -110,6 +111,29 @@ interface CapturedUsage {
 
 function emptyUsage(): CapturedUsage {
   return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0 };
+}
+
+/**
+ * Extract the latest user-role message text. Used by the quality judge so
+ * it knows what the user actually asked. Mirrors the helper in router.ts
+ * but works on a normalised IncomingRequest.
+ */
+function lastUserMessageText(req: IncomingRequest): string {
+  const msgs = req.messages ?? [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (!m || m.role !== "user") continue;
+    const c = m.content;
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) {
+      return c
+        .map((p) => (typeof p?.text === "string" ? p.text : ""))
+        .filter(Boolean)
+        .join("\n");
+    }
+    return "";
+  }
+  return "";
 }
 
 function mergeUsage(into: CapturedUsage, raw: unknown): void {
@@ -376,11 +400,19 @@ app.post("/v1/chat/completions", async (c) => {
 
   const usage = emptyUsage();
 
+  // Captured for the async judge — only used when a successful response
+  // is produced and the call lands on a cheap-tier model.
+  const captured = {
+    userText: lastUserMessageText(body),
+    responseText: "",
+  };
+
   /** Single place that writes the call to the DB. The classifier's own
-   *  cost is folded into cost_usd so the dashboard reflects total spend. */
-  const finalize = (status: number, error: string | null) => {
+   *  cost is folded into cost_usd so the dashboard reflects total spend.
+   *  Returns the inserted DB row id (or 0 if the insert failed). */
+  const finalize = (status: number, error: string | null): number => {
     try {
-      recordCall({
+      const id = recordCall({
         ts: Math.floor(startedAt / 1000),
         requested_model: requestedModel,
         routed_model: actualModel,
@@ -396,8 +428,27 @@ app.post("/v1/chat/completions", async (c) => {
         stream: isStream,
         error,
       });
+      // Async sampled quality judge — fire-and-forget. The user response
+      // has already been streamed/returned at this point, so this can
+      // never delay them. Eligibility (sample rate, min output tokens,
+      // tier filter, substantive-output check) is enforced inside.
+      if (status >= 200 && status < 300 && id > 0) {
+        scheduleJudge(
+          {
+            callId: id,
+            tier: actualTier,
+            userText: captured.userText,
+            responseText: captured.responseText,
+            outputTokens: usage.completion_tokens,
+          },
+          PROVIDERS,
+          JUDGE_CFG,
+        );
+      }
+      return id;
     } catch (err) {
       console.error("[db] failed to record call:", err);
+      return 0;
     }
   };
 
@@ -560,6 +611,36 @@ app.post("/v1/chat/completions", async (c) => {
       if (json && typeof json === "object") {
         if (json.usage) mergeUsage(usage, json.usage);
         finalizeCost(actualProvider.name, actualModel, usage);
+        // Capture assistant text for the async judge.
+        try {
+          const choices = (json as { choices?: unknown }).choices;
+          if (Array.isArray(choices)) {
+            const parts: string[] = [];
+            for (const ch of choices) {
+              const msg = (ch as { message?: { content?: unknown } } | null)?.message;
+              if (typeof msg?.content === "string") parts.push(msg.content);
+              else if (Array.isArray(msg?.content)) {
+                for (const p of msg.content as Array<{ text?: unknown; type?: unknown }>) {
+                  if (typeof p?.text === "string") parts.push(p.text);
+                }
+              }
+              const tcs = (ch as { message?: { tool_calls?: unknown } } | null)?.message?.tool_calls;
+              if (Array.isArray(tcs)) {
+                for (const tc of tcs as Array<{ function?: { name?: unknown; arguments?: unknown } }>) {
+                  const fn = tc?.function;
+                  if (fn && typeof fn === "object") {
+                    parts.push(
+                      `[tool_call ${typeof fn.name === "string" ? fn.name : ""}: ${
+                        typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments ?? {})
+                      }]`,
+                    );
+                  }
+                }
+              }
+            }
+            captured.responseText = parts.join("\n");
+          }
+        } catch { /* ignore */ }
         json.model = requestedModel;
         if (!json._router) {
           json._router = {
@@ -642,12 +723,22 @@ app.post("/v1/chat/completions", async (c) => {
           while ((sep = buffer.indexOf("\n\n")) !== -1) {
             const rawEvent = buffer.slice(0, sep);
             buffer = buffer.slice(sep + 2);
-            const rewritten = rewriteSseEvent(rawEvent, requestedModel, usage);
+            const rewritten = rewriteSseEvent(
+              rawEvent,
+              requestedModel,
+              usage,
+              captured,
+            );
             controller.enqueue(encoder.encode(rewritten + "\n\n"));
           }
         }
         if (buffer.length > 0) {
-          const rewritten = rewriteSseEvent(buffer, requestedModel, usage);
+          const rewritten = rewriteSseEvent(
+            buffer,
+            requestedModel,
+            usage,
+            captured,
+          );
           controller.enqueue(encoder.encode(rewritten));
         }
         finalizeCost(actualProvider.name, actualModel, usage);
@@ -670,14 +761,17 @@ app.post("/v1/chat/completions", async (c) => {
 
 /**
  * Rewrite the `model` field of an SSE event's JSON payload so the client
- * sees the alias it requested instead of the underlying OpenRouter id, and
- * extract any `usage` block we encounter (OpenRouter sends one in the final
- * chunk when `usage.include` is set).
+ * sees the alias it requested instead of the underlying OpenRouter id,
+ * extract any `usage` block we encounter (OpenRouter sends one in the
+ * final chunk when `usage.include` is set), and accumulate the assistant's
+ * delta text + tool-call arguments into `captured.responseText` for the
+ * async quality judge.
  */
 function rewriteSseEvent(
   rawEvent: string,
   requestedModel: string,
   usageOut: CapturedUsage,
+  captured?: { responseText: string },
 ): string {
   if (!rawEvent.includes("data:")) return rawEvent;
   const lines = rawEvent.split("\n");
@@ -696,6 +790,31 @@ function rewriteSseEvent(
       const obj = JSON.parse(payload);
       if (obj && typeof obj === "object") {
         if (obj.usage) mergeUsage(usageOut, obj.usage);
+        if (captured) {
+          const choices = (obj as { choices?: unknown }).choices;
+          if (Array.isArray(choices)) {
+            for (const ch of choices) {
+              const delta = (ch as { delta?: { content?: unknown; tool_calls?: unknown } } | null)?.delta;
+              if (typeof delta?.content === "string") {
+                captured.responseText += delta.content;
+              }
+              const tcs = delta?.tool_calls;
+              if (Array.isArray(tcs)) {
+                for (const tc of tcs as Array<{ function?: { name?: unknown; arguments?: unknown } }>) {
+                  const fn = tc?.function;
+                  if (fn) {
+                    if (typeof fn.name === "string" && fn.name) {
+                      captured.responseText += `\n[tool_call ${fn.name}]`;
+                    }
+                    if (typeof fn.arguments === "string") {
+                      captured.responseText += fn.arguments;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
         if ("model" in obj) {
           obj.model = requestedModel;
           out.push(`data: ${JSON.stringify(obj)}`);

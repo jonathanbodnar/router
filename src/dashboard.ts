@@ -4,7 +4,9 @@ import {
   byModel,
   byProject,
   byWorkType,
+  qualitySummary,
   recent,
+  recentLowQuality,
   totals,
   type Period,
 } from "./db.js";
@@ -79,6 +81,8 @@ export function mountDashboard(app: Hono): void {
       by_project: byProject(period),
       by_work_type: byWorkType(period),
       breaker: breakerSnapshot(),
+      quality: qualitySummary(period),
+      low_quality: recentLowQuality(period, 6, 50),
       recent: recent(period, 100),
       generated_at: Math.floor(Date.now() / 1000),
     });
@@ -159,6 +163,18 @@ const DASHBOARD_HTML = `<!doctype html>
   .pill.rework { color: var(--warn); border-color: #4d3f1c; background: #2a2418; }
   .pill.new_feature { color: var(--good); border-color: #1c4d2c; background: #18261d; }
   .pill.other { color: var(--muted); }
+  .score { display: inline-block; padding: 1px 6px; border-radius: 4px;
+           font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .score.lo  { color: var(--bad);  background: #2a1818; border: 1px solid #4d2a2a; }
+  .score.mid { color: var(--warn); background: #2a2418; border: 1px solid #4d3f1c; }
+  .score.hi  { color: var(--good); background: #18261d; border: 1px solid #1c4d2c; }
+  tr.qrow td {
+    background: #14201a; border-top: 0; padding: 6px 10px 12px;
+    white-space: pre-wrap; word-break: break-word; font-size: 11px; line-height: 1.45;
+    color: var(--muted);
+  }
+  tr.qrow .reasons { color: var(--text); }
+  tr.qrow .flag { color: var(--warn); margin-left: 8px; }
   .muted { color: var(--muted); }
   .row { display: flex; align-items: center; gap: 8px; }
   .err { color: var(--bad); }
@@ -197,6 +213,14 @@ const DASHBOARD_HTML = `<!doctype html>
       <code>X-Router-Project</code> header. Work type is heuristic on the last
       user message; override with <code>X-Router-Work-Type</code>.
     </div></div>
+  </section>
+  <section class="card" id="quality_card" style="display:none">
+    <h2>Quality (sampled MiMo / DeepSeek calls)</h2>
+    <div id="quality_summary"></div>
+  </section>
+  <section class="card" id="low_quality_card" style="display:none">
+    <h2>Low-quality calls (score &lt; 6)</h2>
+    <div id="low_quality"></div>
   </section>
   <section class="card" id="breaker_card" style="display:none">
     <h2>Circuit breaker</h2>
@@ -268,6 +292,12 @@ const DASHBOARD_HTML = `<!doctype html>
     })[c]);
   }
 
+  function scoreBadge(score) {
+    if (score == null) return '<span class="muted">—</span>';
+    const cls = score < 6 ? 'lo' : score < 8 ? 'mid' : 'hi';
+    return \`<span class="score \${cls}">\${score}</span>\`;
+  }
+
   function recentTable(rows) {
     if (!rows.length) return '<div class="empty">no data yet</div>';
     const body = rows.map(r => {
@@ -281,14 +311,40 @@ const DASHBOARD_HTML = `<!doctype html>
         <td class="num">\${fmtMoney(r.cost_usd)}</td>
         <td class="num muted">\${fmtDur(r.duration_ms)}</td>
         <td class="num \${r.status >= 400 ? 'err' : 'muted'}">\${r.status}</td>
+        <td class="num">\${scoreBadge(r.quality_score)}</td>
       </tr>\`;
-      if (!r.error) return main;
-      return main + \`<tr class="errrow"><td colspan="9" class="mono err">\${escapeHtml(r.error)}</td></tr>\`;
+      const extras = [];
+      if (r.error) {
+        extras.push(\`<tr class="errrow"><td colspan="10" class="mono err">\${escapeHtml(r.error)}</td></tr>\`);
+      }
+      if (r.quality_reasons) {
+        const flag = r.quality_better_with_sonnet
+          ? '<span class="flag">⚑ would be better on Sonnet</span>'
+          : '';
+        extras.push(\`<tr class="qrow"><td colspan="10">judge: <span class="reasons">\${escapeHtml(r.quality_reasons)}</span>\${flag}</td></tr>\`);
+      }
+      return main + extras.join("");
     }).join("");
     return \`<table><thead><tr>
       <th>Time</th><th>Project</th><th>Type</th><th>Model</th>
       <th class="num">In</th><th class="num">Out</th><th class="num">Cost</th>
-      <th class="num">Dur</th><th class="num">Status</th>
+      <th class="num">Dur</th><th class="num">Status</th><th class="num">Score</th>
+    </tr></thead><tbody>\${body}</tbody></table>\`;
+  }
+
+  function lowQualityTable(rows) {
+    if (!rows.length) return '<div class="empty">nothing flagged in this period</div>';
+    const body = rows.map(r => \`<tr>
+      <td class="num">\${scoreBadge(r.quality_score)}</td>
+      <td class="mono muted">\${fmtTime(r.ts)}</td>
+      <td>\${r.project ? '<code>' + r.project + '</code>' : '<span class="muted">—</span>'}</td>
+      <td class="mono">\${escapeHtml(r.routed_model)}</td>
+      <td class="reasons">\${escapeHtml(r.quality_reasons || '')}</td>
+      <td class="num \${r.quality_better_with_sonnet ? 'err' : 'muted'}">\${r.quality_better_with_sonnet ? 'yes' : '—'}</td>
+    </tr>\`).join("");
+    return \`<table><thead><tr>
+      <th class="num">Score</th><th>Time</th><th>Project</th><th>Model</th>
+      <th>Judge reasoning</th><th class="num">Sonnet?</th>
     </tr></thead><tbody>\${body}</tbody></table>\`;
   }
 
@@ -311,6 +367,31 @@ const DASHBOARD_HTML = `<!doctype html>
     $("by_work_type").innerHTML   = workTypeTable(data.by_work_type);
     $("recent").innerHTML         = recentTable(data.recent);
     $("updated").textContent      = "updated " + new Date(data.generated_at * 1000).toLocaleTimeString();
+
+    const q = data.quality || { judged_calls: 0 };
+    if (q.judged_calls > 0) {
+      $("quality_card").style.display = "";
+      const avg = q.avg_score == null ? '—' : q.avg_score.toFixed(2);
+      const flagged = q.flagged_for_sonnet || 0;
+      $("quality_summary").innerHTML = \`<div class="row" style="gap:32px">
+        <div><div class="label muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.04em">Judged calls</div>
+             <div style="font-size:20px;font-weight:600;margin-top:2px">\${fmtInt(q.judged_calls)}</div></div>
+        <div><div class="label muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.04em">Avg score</div>
+             <div style="font-size:20px;font-weight:600;margin-top:2px">\${avg}</div></div>
+        <div><div class="label muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.04em">Flagged for Sonnet</div>
+             <div style="font-size:20px;font-weight:600;margin-top:2px">\${fmtInt(flagged)}</div></div>
+      </div>\`;
+    } else {
+      $("quality_card").style.display = "none";
+    }
+
+    const lq = data.low_quality || [];
+    if (lq.length > 0) {
+      $("low_quality_card").style.display = "";
+      $("low_quality").innerHTML = lowQualityTable(lq);
+    } else {
+      $("low_quality_card").style.display = "none";
+    }
 
     const breaker = (data.breaker || []).filter(b => b.consecutiveFails > 0 || b.openMsRemaining > 0);
     if (breaker.length) {

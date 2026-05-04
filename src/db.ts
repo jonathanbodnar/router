@@ -41,6 +41,29 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_calls_work_type ON calls(work_type);
 `);
 
+/**
+ * Quality-judge columns added in a later migration. We use IF NOT EXISTS-style
+ * ALTER TABLE so existing deployments pick them up on next start without
+ * dropping data. SQLite lacks `ADD COLUMN IF NOT EXISTS`, so we introspect.
+ */
+{
+  const existing = new Set<string>(
+    (db
+      .prepare(`PRAGMA table_info(calls)`)
+      .all() as Array<{ name: string }>).map((r) => r.name),
+  );
+  const addColumn = (name: string, decl: string) => {
+    if (!existing.has(name)) db.exec(`ALTER TABLE calls ADD COLUMN ${decl}`);
+  };
+  addColumn("quality_score", "quality_score INTEGER");
+  addColumn("quality_reasons", "quality_reasons TEXT");
+  addColumn("quality_better_with_sonnet", "quality_better_with_sonnet INTEGER");
+  addColumn("quality_judge_model", "quality_judge_model TEXT");
+  addColumn("quality_judge_cost_usd", "quality_judge_cost_usd REAL");
+  addColumn("quality_judged_at", "quality_judged_at INTEGER");
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_calls_quality_score ON calls(quality_score)`);
+}
+
 export interface CallRecord {
   ts: number;
   requested_model: string | null;
@@ -70,8 +93,40 @@ const insertStmt = db.prepare(`
   )
 `);
 
-export function recordCall(r: CallRecord): void {
-  insertStmt.run({ ...r, stream_int: r.stream ? 1 : 0 });
+export function recordCall(r: CallRecord): number {
+  const info = insertStmt.run({ ...r, stream_int: r.stream ? 1 : 0 });
+  return Number(info.lastInsertRowid);
+}
+
+/* ---------- judge-pass quality updates ---------- */
+
+export interface QualityUpdate {
+  call_id: number;
+  score: number;
+  reasons: string;
+  better_with_sonnet: boolean;
+  judge_model: string;
+  judge_cost_usd: number;
+}
+
+const updateQualityStmt = db.prepare(`
+  UPDATE calls SET
+    quality_score              = @score,
+    quality_reasons            = @reasons,
+    quality_better_with_sonnet = @better_int,
+    quality_judge_model        = @judge_model,
+    quality_judge_cost_usd     = @judge_cost_usd,
+    quality_judged_at          = @judged_at,
+    cost_usd                   = cost_usd + @judge_cost_usd
+  WHERE id = @call_id
+`);
+
+export function updateQuality(u: QualityUpdate): void {
+  updateQualityStmt.run({
+    ...u,
+    better_int: u.better_with_sonnet ? 1 : 0,
+    judged_at: Math.floor(Date.now() / 1000),
+  });
 }
 
 /* ---------- queries used by the dashboard ---------- */
@@ -166,6 +221,12 @@ export interface RecentCall {
   status: number;
   stream: number;
   error: string | null;
+  quality_score: number | null;
+  quality_reasons: string | null;
+  quality_better_with_sonnet: number | null;
+  quality_judge_model: string | null;
+  quality_judge_cost_usd: number | null;
+  quality_judged_at: number | null;
 }
 
 export function recent(period: Period, limit = 100): RecentCall[] {
@@ -175,4 +236,56 @@ export function recent(period: Period, limit = 100): RecentCall[] {
       `SELECT * FROM calls WHERE ts >= ? ORDER BY ts DESC LIMIT ?`,
     )
     .all(since, limit) as RecentCall[];
+}
+
+/**
+ * Rows where the judge gave a low quality score. Used to surface the
+ * "MiMo dropped quality here" cases in the dashboard so we can decide
+ * whether to upgrade the heuristic or add a keyword pattern.
+ */
+export function recentLowQuality(
+  period: Period,
+  threshold = 6,
+  limit = 50,
+): RecentCall[] {
+  const since = sinceFor(period);
+  return db
+    .prepare(
+      `SELECT * FROM calls
+       WHERE ts >= ?
+         AND quality_score IS NOT NULL
+         AND quality_score < ?
+       ORDER BY quality_score ASC, ts DESC
+       LIMIT ?`,
+    )
+    .all(since, threshold, limit) as RecentCall[];
+}
+
+export interface QualitySummary {
+  judged_calls: number;
+  avg_score: number | null;
+  flagged_for_sonnet: number;
+}
+
+export function qualitySummary(period: Period): QualitySummary {
+  const since = sinceFor(period);
+  const row = db
+    .prepare(
+      `SELECT
+         COUNT(*) AS judged_calls,
+         AVG(quality_score) AS avg_score,
+         SUM(quality_better_with_sonnet) AS flagged_for_sonnet
+       FROM calls
+       WHERE ts >= ? AND quality_score IS NOT NULL`,
+    )
+    .get(since) as {
+    judged_calls: number;
+    avg_score: number | null;
+    flagged_for_sonnet: number | null;
+  };
+  return {
+    judged_calls: row.judged_calls ?? 0,
+    avg_score: row.avg_score,
+    flagged_for_sonnet: row.flagged_for_sonnet ?? 0,
+  };
 }
