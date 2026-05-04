@@ -90,6 +90,9 @@ export interface IncomingRequest {
   tool_choice?: unknown;
   stream?: boolean;
   usage?: unknown;
+  /** OpenRouter unified reasoning controls. We inject defaults for
+   *  reasoning-heavy models (e.g. MiMo) when the client omits this. */
+  reasoning?: { effort?: "low" | "medium" | "high"; max_tokens?: number; exclude?: boolean } | unknown;
   // ...other OpenAI fields are passed through untouched.
   [k: string]: unknown;
 }

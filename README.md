@@ -64,6 +64,27 @@ at 25% sampling, ~$0.05/day. The judge's cost is added to that call's
 Off by default. Turn it on with `ROUTER_JUDGE=1`. See `.env.example`
 for sampling / threshold / model overrides.
 
+### Reasoning-model controls
+
+Reasoning-heavy models like Xiaomi MiMo V2.5 Pro and Anthropic's
+extended-thinking variants run an internal chain-of-thought before
+emitting any visible output. With OpenRouter's defaults (`high` effort)
+MiMo regularly burns 1–2 minutes of internal reasoning per turn — long
+enough that Cursor looks hung even though the request is healthy and
+streaming. Two knobs (in `src/reasoning.ts`) keep this in check:
+
+1. **Default effort injection.** Outbound requests for known reasoning
+   models get `reasoning: { effort: "low" }` prepended when the client
+   didn't already set one. MiMo is in the table by default. Override
+   globally with `ROUTER_REASONING_EFFORT={low|medium|high}`, or
+   per-model by editing `REASONING_EFFORT_DEFAULTS`.
+2. **Reasoning stripping.** `reasoning` and `reasoning_details` fields
+   are stripped from streamed deltas and non-streaming messages before
+   forwarding to the client. Cursor doesn't render them anyway, and the
+   chain-of-thought wire payload is often 10–100x larger than the
+   actual content. Disable with `ROUTER_KEEP_REASONING=1` if your
+   client *does* render reasoning.
+
 ### Picking the model from inside a prompt
 
 You don't have to switch the Cursor model dropdown to force a tier. Start

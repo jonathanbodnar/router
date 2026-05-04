@@ -15,6 +15,11 @@ import { DEFAULT_CONFIG as CLASSIFIER_CFG, maybeUpgradeWithLLM } from "./llm-cla
 import { normaliseBody } from "./normalise.js";
 import { computeCost } from "./pricing.js";
 import { loadProviders, type Provider } from "./providers.js";
+import {
+  shouldStripReasoning,
+  stripReasoningInPlace,
+  withReasoningEffort,
+} from "./reasoning.js";
 import { MODELS, route, type IncomingRequest } from "./router.js";
 
 const { ROUTER_API_KEY, ROUTER_LOG, PORT } = process.env;
@@ -156,6 +161,8 @@ function withUsageIncluded(body: IncomingRequest): IncomingRequest {
       : {};
   return { ...body, usage: { ...existing, include: true } };
 }
+
+const STRIP_REASONING = shouldStripReasoning();
 
 /**
  * Some clients (Cursor, OpenAI Responses-API consumers, etc.) post bodies
@@ -353,6 +360,7 @@ app.post("/v1/chat/completions", async (c) => {
   ): { url: string; init: RequestInit } => {
     let payload: IncomingRequest = { ...body, model };
     if (p.injectUsageInclude) payload = withUsageIncluded(payload);
+    payload = withReasoningEffort(payload, model);
 
     const headers: Record<string, string> = {};
     c.req.raw.headers.forEach((value, name) => {
@@ -611,20 +619,25 @@ app.post("/v1/chat/completions", async (c) => {
       if (json && typeof json === "object") {
         if (json.usage) mergeUsage(usage, json.usage);
         finalizeCost(actualProvider.name, actualModel, usage);
-        // Capture assistant text for the async judge.
+        // Capture assistant text for the async judge, and optionally
+        // strip reasoning fields the upstream included.
         try {
           const choices = (json as { choices?: unknown }).choices;
           if (Array.isArray(choices)) {
             const parts: string[] = [];
             for (const ch of choices) {
-              const msg = (ch as { message?: { content?: unknown } } | null)?.message;
-              if (typeof msg?.content === "string") parts.push(msg.content);
-              else if (Array.isArray(msg?.content)) {
-                for (const p of msg.content as Array<{ text?: unknown; type?: unknown }>) {
+              const msg = (ch as { message?: Record<string, unknown> } | null)?.message;
+              if (msg && typeof msg === "object" && STRIP_REASONING) {
+                stripReasoningInPlace(msg);
+              }
+              const content = msg?.content;
+              if (typeof content === "string") parts.push(content);
+              else if (Array.isArray(content)) {
+                for (const p of content as Array<{ text?: unknown; type?: unknown }>) {
                   if (typeof p?.text === "string") parts.push(p.text);
                 }
               }
-              const tcs = (ch as { message?: { tool_calls?: unknown } } | null)?.message?.tool_calls;
+              const tcs = msg?.tool_calls;
               if (Array.isArray(tcs)) {
                 for (const tc of tcs as Array<{ function?: { name?: unknown; arguments?: unknown } }>) {
                   const fn = tc?.function;
@@ -790,24 +803,32 @@ function rewriteSseEvent(
       const obj = JSON.parse(payload);
       if (obj && typeof obj === "object") {
         if (obj.usage) mergeUsage(usageOut, obj.usage);
-        if (captured) {
-          const choices = (obj as { choices?: unknown }).choices;
-          if (Array.isArray(choices)) {
-            for (const ch of choices) {
-              const delta = (ch as { delta?: { content?: unknown; tool_calls?: unknown } } | null)?.delta;
-              if (typeof delta?.content === "string") {
-                captured.responseText += delta.content;
+        let mutated = false;
+        const choices = (obj as { choices?: unknown }).choices;
+        if (Array.isArray(choices)) {
+          for (const ch of choices) {
+            const choice = ch as { delta?: Record<string, unknown> } | null;
+            const delta = choice?.delta;
+            if (delta && typeof delta === "object") {
+              if (STRIP_REASONING && stripReasoningInPlace(delta)) {
+                mutated = true;
               }
-              const tcs = delta?.tool_calls;
-              if (Array.isArray(tcs)) {
-                for (const tc of tcs as Array<{ function?: { name?: unknown; arguments?: unknown } }>) {
-                  const fn = tc?.function;
-                  if (fn) {
-                    if (typeof fn.name === "string" && fn.name) {
-                      captured.responseText += `\n[tool_call ${fn.name}]`;
-                    }
-                    if (typeof fn.arguments === "string") {
-                      captured.responseText += fn.arguments;
+              if (captured) {
+                const c = delta.content;
+                if (typeof c === "string") captured.responseText += c;
+                const tcs = delta.tool_calls;
+                if (Array.isArray(tcs)) {
+                  for (const tc of tcs as Array<{
+                    function?: { name?: unknown; arguments?: unknown };
+                  }>) {
+                    const fn = tc?.function;
+                    if (fn) {
+                      if (typeof fn.name === "string" && fn.name) {
+                        captured.responseText += `\n[tool_call ${fn.name}]`;
+                      }
+                      if (typeof fn.arguments === "string") {
+                        captured.responseText += fn.arguments;
+                      }
                     }
                   }
                 }
@@ -817,6 +838,9 @@ function rewriteSseEvent(
         }
         if ("model" in obj) {
           obj.model = requestedModel;
+          mutated = true;
+        }
+        if (mutated) {
           out.push(`data: ${JSON.stringify(obj)}`);
           continue;
         }
