@@ -32,11 +32,7 @@ const cleanEnv = () => {
 
 // --------------- classifyEffort ---------------
 
-console.log("\n=== classifyEffort: agentic tier (MiMo) — always low ===\n");
-// MiMo is capped at low because Cursor has a ~5s first-content-token
-// timeout. Medium/high reasoning causes MiMo to think for 10-20+ seconds,
-// triggering infinite retry storms. Tasks needing deep thinking should
-// route to Sonnet/Opus instead.
+console.log("\n=== classifyEffort: agentic tier — low effort ===\n");
 
 cleanEnv();
 {
@@ -53,32 +49,70 @@ cleanEnv();
 }
 {
   expect(
-    "bug fix description = low (capped for Cursor compat)",
-    classifyEffort("debug the login form race condition in useEffect cleanup", 5, "agentic") === "low",
+    "rename a variable = low",
+    classifyEffort("rename getUserData to fetchUserProfile", 2, "agentic") === "low",
   );
 }
 {
   expect(
-    "build new feature = low (capped for Cursor compat)",
-    classifyEffort("build a new settings page with dark mode toggle", 5, "agentic") === "low",
+    "typo fix = low",
+    classifyEffort("fix the typo in the error message", 4, "agentic") === "low",
+  );
+}
+
+console.log("\n=== classifyEffort: agentic tier — medium effort ===\n");
+
+{
+  const msg =
+    "the login form is showing a flash of unstyled content after submitting, " +
+    "can you debug this and figure out why the state reset is happening " +
+    "before the redirect completes? I think it might be a race condition.";
+  expect(
+    "bug fix description = medium",
+    classifyEffort(msg, 5, "agentic") === "medium",
+    `tokens≈${Math.ceil(msg.length / 4)}`,
+  );
+}
+
+console.log("\n=== classifyEffort: agentic tier — high effort ===\n");
+
+{
+  expect(
+    "build a new component = high",
+    classifyEffort("build a new settings page with dark mode toggle", 5, "agentic") === "high",
   );
 }
 {
   expect(
-    "agent mode: short turn = low",
-    classifyEffort("here is the file content", 19, "agentic") === "low",
+    "create a new API endpoint = high",
+    classifyEffort("create a new REST endpoint for user preferences", 4, "agentic") === "high",
   );
 }
 {
   expect(
-    "agent mode: build signal = low (capped)",
-    classifyEffort("build a new REST endpoint for user preferences", 19, "agentic") === "low",
+    "from scratch = high",
+    classifyEffort("write the auth middleware from scratch", 2, "agentic") === "high",
+  );
+}
+
+console.log("\n=== classifyEffort: agent mode (tools >= 10) ===\n");
+
+{
+  expect(
+    "agent mode: short turn = medium (floor)",
+    classifyEffort("here is the file content", 19, "agentic") === "medium",
   );
 }
 {
   expect(
-    "agent mode: generic mid-task = low",
-    classifyEffort("Now I'll update ShowKPIPage.tsx", 19, "agentic") === "low",
+    "agent mode: build signal = high",
+    classifyEffort("build a new REST endpoint for user preferences", 19, "agentic") === "high",
+  );
+}
+{
+  expect(
+    "agent mode: generic mid-task = medium",
+    classifyEffort("Now I'll update ShowKPIPage.tsx", 19, "agentic") === "medium",
   );
 }
 
@@ -112,11 +146,11 @@ cleanEnv();
   const out = withReasoningEffort(
     { model: "xiaomi/mimo-v2.5-pro" },
     "xiaomi/mimo-v2.5-pro",
-    "low",
-  ) as { reasoning?: { effort?: string; max_tokens?: number } };
+    "medium",
+  ) as { reasoning?: { effort?: string } };
   expect(
-    "MiMo gets low effort + max_tokens cap",
-    out.reasoning?.effort === "low" && out.reasoning?.max_tokens === 128,
+    "MiMo gets dynamic medium effort",
+    out.reasoning?.effort === "medium",
     `reasoning=${JSON.stringify(out.reasoning)}`,
   );
 }
@@ -150,10 +184,10 @@ cleanEnv();
     { model: "anthropic/claude-opus-4.7" },
     "anthropic/claude-opus-4.7",
     null,
-  ) as { reasoning?: { effort?: string; max_tokens?: number } };
+  ) as { reasoning?: { effort?: string } };
   expect(
-    "Opus gets high effort, no max_tokens cap",
-    out.reasoning?.effort === "high" && !out.reasoning?.max_tokens,
+    "Opus falls back to static default (high)",
+    out.reasoning?.effort === "high",
     `reasoning=${JSON.stringify(out.reasoning)}`,
   );
 }
@@ -164,10 +198,10 @@ cleanEnv();
 process.env.ROUTER_REASONING_EFFORT = "medium";
 {
   const out = withReasoningEffort({}, "xiaomi/mimo-v2.5-pro", "low") as
-    & { reasoning?: { effort?: string; max_tokens?: number } };
+    & { reasoning?: { effort?: string } };
   expect(
-    "env=medium overrides dynamic + keeps max_tokens cap",
-    out.reasoning?.effort === "medium" && out.reasoning?.max_tokens === 128,
+    "env=medium overrides dynamic low",
+    out.reasoning?.effort === "medium",
     `reasoning=${JSON.stringify(out.reasoning)}`,
   );
 }
@@ -184,10 +218,10 @@ cleanEnv();
 process.env.ROUTER_REASONING_EFFORT = "garbage";
 {
   const out = withReasoningEffort({}, "xiaomi/mimo-v2.5-pro", "low") as
-    & { reasoning?: { effort?: string; max_tokens?: number } };
+    & { reasoning?: { effort?: string } };
   expect(
-    "invalid env falls back to dynamic effort + cap",
-    out.reasoning?.effort === "low" && out.reasoning?.max_tokens === 128,
+    "invalid env falls back to dynamic effort",
+    out.reasoning?.effort === "low",
     `reasoning=${JSON.stringify(out.reasoning)}`,
   );
 }

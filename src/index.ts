@@ -18,8 +18,6 @@ import { loadProviders, type Provider } from "./providers.js";
 import {
   classifyEffort,
   type ReasoningEffort,
-  shouldStripReasoning,
-  stripReasoningInPlace,
   withReasoningEffort,
 } from "./reasoning.js";
 import { MODELS, route, type IncomingRequest } from "./router.js";
@@ -164,7 +162,6 @@ function withUsageIncluded(body: IncomingRequest): IncomingRequest {
   return { ...body, usage: { ...existing, include: true } };
 }
 
-const STRIP_REASONING = shouldStripReasoning();
 
 /**
  * Some clients (Cursor, OpenAI Responses-API consumers, etc.) post bodies
@@ -640,9 +637,6 @@ app.post("/v1/chat/completions", async (c) => {
             const parts: string[] = [];
             for (const ch of choices) {
               const msg = (ch as { message?: Record<string, unknown> } | null)?.message;
-              if (msg && typeof msg === "object" && STRIP_REASONING) {
-                stripReasoningInPlace(msg);
-              }
               const content = msg?.content;
               if (typeof content === "string") parts.push(content);
               else if (Array.isArray(content)) {
@@ -794,26 +788,6 @@ app.post("/v1/chat/completions", async (c) => {
  * delta text + tool-call arguments into `captured.responseText` for the
  * async quality judge.
  */
-/**
- * After stripping reasoning fields, check if a choice is now empty —
- * i.e. delta has only content:"" and/or role, with no tool_calls and
- * no finish_reason. These are reasoning-only heartbeat chunks that
- * would show up as dead air in Cursor.
- */
-function isEmptyDelta(
-  choice: { delta?: Record<string, unknown>; finish_reason?: unknown } | null,
-): boolean {
-  if (!choice) return true;
-  if (choice.finish_reason) return false;
-  const d = choice.delta;
-  if (!d) return true;
-  if (d.tool_calls) return false;
-  const c = d.content;
-  if (typeof c === "string" && c.length > 0) return false;
-  if (d.function_call) return false;
-  return true;
-}
-
 function rewriteSseEvent(
   rawEvent: string,
   requestedModel: string,
@@ -844,9 +818,13 @@ function rewriteSseEvent(
             const choice = ch as { delta?: Record<string, unknown> } | null;
             const delta = choice?.delta;
             if (delta && typeof delta === "object") {
-              if (STRIP_REASONING && stripReasoningInPlace(delta)) {
-                mutated = true;
-              }
+              // Do NOT strip reasoning from streaming deltas. Cursor
+              // needs the constant flow of SSE data events (even with
+              // content:"") to know the stream is alive. When we
+              // stripped reasoning + dropped empty chunks, Cursor saw
+              // dead air and retried in an infinite loop. Passing
+              // reasoning through matches what Cursor sees when
+              // connected directly to OpenRouter.
               if (captured) {
                 const c = delta.content;
                 if (typeof c === "string") captured.responseText += c;
@@ -866,14 +844,6 @@ function rewriteSseEvent(
                     }
                   }
                 }
-              }
-              // After stripping reasoning, if the delta is now just
-              // { content: "", role: "..." } with no tool_calls and no
-              // finish_reason, it's a reasoning-only chunk. Drop it so
-              // Cursor doesn't see a stream of empty events that make
-              // it think the response is stalled.
-              if (mutated && isEmptyDelta(choice)) {
-                return "";
               }
             }
           }

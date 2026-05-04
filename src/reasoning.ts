@@ -49,15 +49,6 @@ export const REASONING_EFFORT_DEFAULTS: Record<string, ReasoningEffort> = {
   "anthropic/claude-opus-4.7": "high",
 };
 
-/**
- * Max reasoning tokens per model. Caps how long the model can "think"
- * before it must start emitting content. Critical for MiMo because
- * Cursor has a ~5s first-content-token timeout — if MiMo reasons for
- * longer, Cursor cancels and retries in an infinite loop.
- */
-const REASONING_MAX_TOKENS: Record<string, number> = {
-  "xiaomi/mimo-v2.5-pro": 128,
-};
 
 /* ------------------------------------------------------------------ */
 /*  Dynamic effort classification                                     */
@@ -148,19 +139,33 @@ export function classifyEffort(
 
   // ---- agentic (MiMo) tier: dynamic classification ----
   //
-  // CONSTRAINT: Cursor has a ~5 second first-content-token timeout.
-  // If MiMo spends longer than that reasoning, Cursor cancels the
-  // request and retries — creating an infinite retry storm. With
-  // MiMo, even "medium" effort can burn 10-20 seconds in reasoning.
-  // So we ALWAYS use "low" for MiMo and rely on the max_tokens cap
-  // (128 tokens) to force fast first-token. The quality difference
-  // between low+128tok and medium is negligible for tool-calling.
-  //
-  // For tasks that truly need deep thinking, the tier classifier
-  // should route to Sonnet or Opus instead of trying to make MiMo
-  // think harder.
+  // Now that we pass reasoning chunks through to Cursor (instead of
+  // stripping them), Cursor sees the stream as alive during MiMo's
+  // thinking phase — just like when connected directly to OpenRouter.
+  // So we can safely use medium/high effort without triggering
+  // Cursor's retry logic.
 
-  return "low";
+  const isHighSignal = HIGH_RE.test(userText);
+
+  // HIGH signals always win, regardless of message length.
+  if (isHighSignal) return "high";
+
+  // Full agent mode (Cursor sends ~19 tools). In a multi-turn agent
+  // conversation the "last user message" is often a tool result, not
+  // the original task. Floor at medium so agent turns don't get low.
+  const isAgentMode = toolCount >= 10;
+  const floor: ReasoningEffort = isAgentMode ? "medium" : "low";
+
+  // Very short user message + few tools = simple tool-call relay.
+  if (!isAgentMode && userTokens < 30 && toolCount > 0) return "low";
+
+  // Trivial / mechanical signals for short messages.
+  if (!isAgentMode && LOW_RE.test(userText) && userTokens < 150) return "low";
+
+  if (userTokens > 80) return "medium";
+  if (userTokens > 30) return "medium";
+
+  return floor;
 }
 
 /* ------------------------------------------------------------------ */
@@ -191,10 +196,7 @@ export function withReasoningEffort<B extends { reasoning?: unknown }>(
   const envOverride = envEffort();
   if (envOverride) {
     if (!REASONING_CAPABLE_MODELS.has(model)) return body;
-    const r: Record<string, unknown> = { effort: envOverride };
-    const maxTok = REASONING_MAX_TOKENS[model];
-    if (maxTok) r.max_tokens = maxTok;
-    return { ...body, reasoning: r };
+    return { ...body, reasoning: { effort: envOverride } };
   }
 
   // Dynamic effort from classifier, falling back to static default.
@@ -202,10 +204,7 @@ export function withReasoningEffort<B extends { reasoning?: unknown }>(
   if (!resolved) return body;
   if (!REASONING_CAPABLE_MODELS.has(model)) return body;
 
-  const reasoning: Record<string, unknown> = { effort: resolved };
-  const maxTok = REASONING_MAX_TOKENS[model];
-  if (maxTok) reasoning.max_tokens = maxTok;
-  return { ...body, reasoning };
+  return { ...body, reasoning: { effort: resolved } };
 }
 
 /* ------------------------------------------------------------------ */
