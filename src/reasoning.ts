@@ -35,7 +35,6 @@ export type ReasoningEffort = "low" | "medium" | "high";
 /* ------------------------------------------------------------------ */
 
 const REASONING_CAPABLE_MODELS = new Set([
-  "xiaomi/mimo-v2.5-pro",
   "anthropic/claude-opus-4.7",
 ]);
 
@@ -45,9 +44,18 @@ const REASONING_CAPABLE_MODELS = new Set([
  * set get no injection at all (provider default).
  */
 export const REASONING_EFFORT_DEFAULTS: Record<string, ReasoningEffort> = {
-  "xiaomi/mimo-v2.5-pro": "low",
   "anthropic/claude-opus-4.7": "high",
 };
+
+/**
+ * Models where we explicitly disable reasoning via `enabled: false`.
+ * MiMo doesn't support `effort` levels — only on/off. Disabling
+ * reasoning makes it produce content immediately, avoiding Cursor's
+ * ~3s timeout for "gpt-4.1" model names.
+ */
+const REASONING_DISABLED_MODELS = new Set([
+  "xiaomi/mimo-v2.5-pro",
+]);
 
 /* ------------------------------------------------------------------ */
 /*  Dynamic effort classification                                     */
@@ -176,6 +184,12 @@ export function withReasoningEffort<B extends { reasoning?: unknown }>(
 ): B {
   // Respect anything the client (or our normaliser) already set.
   if (body.reasoning && typeof body.reasoning === "object") return body;
+
+  // Models where reasoning is explicitly disabled (e.g. MiMo — no
+  // effort control, and Cursor can't wait for the thinking phase).
+  if (REASONING_DISABLED_MODELS.has(model)) {
+    return { ...body, reasoning: { enabled: false } };
+  }
 
   // Global env override wins everything.
   const envOverride = envEffort();

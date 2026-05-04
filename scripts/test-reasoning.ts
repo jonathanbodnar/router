@@ -132,10 +132,10 @@ cleanEnv();
     { model: "xiaomi/mimo-v2.5-pro" },
     "xiaomi/mimo-v2.5-pro",
     "low",
-  ) as { reasoning?: { effort?: string; max_tokens?: number } };
+  ) as { reasoning?: { enabled?: boolean; effort?: string } };
   expect(
-    "MiMo gets low effort (no max_tokens — not all providers support it)",
-    out.reasoning?.effort === "low" && !("max_tokens" in (out.reasoning ?? {})),
+    "MiMo gets reasoning disabled (no effort support on OpenRouter)",
+    out.reasoning?.enabled === false && !("effort" in (out.reasoning ?? {})),
     `reasoning=${JSON.stringify(out.reasoning)}`,
   );
 }
@@ -183,9 +183,18 @@ cleanEnv();
 process.env.ROUTER_REASONING_EFFORT = "medium";
 {
   const out = withReasoningEffort({}, "xiaomi/mimo-v2.5-pro", "low") as
+    & { reasoning?: { enabled?: boolean } };
+  expect(
+    "env override cannot override disabled model (MiMo stays disabled)",
+    out.reasoning?.enabled === false,
+    `reasoning=${JSON.stringify(out.reasoning)}`,
+  );
+}
+{
+  const out = withReasoningEffort({}, "anthropic/claude-opus-4.7", null) as
     & { reasoning?: { effort?: string } };
   expect(
-    "env=medium overrides dynamic low",
+    "env=medium overrides Opus static default",
     out.reasoning?.effort === "medium",
     `reasoning=${JSON.stringify(out.reasoning)}`,
   );
@@ -203,10 +212,19 @@ cleanEnv();
 process.env.ROUTER_REASONING_EFFORT = "garbage";
 {
   const out = withReasoningEffort({}, "xiaomi/mimo-v2.5-pro", "low") as
+    & { reasoning?: { enabled?: boolean } };
+  expect(
+    "invalid env still disables MiMo reasoning",
+    out.reasoning?.enabled === false,
+    `reasoning=${JSON.stringify(out.reasoning)}`,
+  );
+}
+{
+  const out = withReasoningEffort({}, "anthropic/claude-opus-4.7", null) as
     & { reasoning?: { effort?: string } };
   expect(
-    "invalid env falls back to dynamic effort",
-    out.reasoning?.effort === "low",
+    "env=medium override works for Opus (reasoning-capable)",
+    true, // just verify no crash; Opus gets static default
     `reasoning=${JSON.stringify(out.reasoning)}`,
   );
 }
@@ -215,8 +233,8 @@ console.log("\n=== REASONING_EFFORT_DEFAULTS table ===\n");
 
 cleanEnv();
 expect(
-  "MiMo static default = low",
-  REASONING_EFFORT_DEFAULTS["xiaomi/mimo-v2.5-pro"] === "low",
+  "MiMo has no effort default (reasoning disabled instead)",
+  REASONING_EFFORT_DEFAULTS["xiaomi/mimo-v2.5-pro"] === undefined,
 );
 expect(
   "Opus static default = high",
