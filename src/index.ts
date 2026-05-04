@@ -488,22 +488,26 @@ app.post("/v1/chat/completions", async (c) => {
    * Returns the (final) Response, with body never consumed.
    */
   const callUpstreamWithFallback = async (): Promise<Response> => {
-    // Priority list of (tier, model, provider) to try. We always try the
-    // routed model first; on failure we try Sonnet (the most reliable
-    // OpenAI-shaped tool-calling target on OpenRouter); and finally
-    // DeepSeek-on-Fireworks as a hard last resort because it's on a
-    // completely separate provider from OR — even a full OR outage still
-    // gets the user a response so Cursor's BYOK proxy doesn't trip.
+    // Priority list of (tier, model, provider) to try. The fallback
+    // chain is cost-aware: cheap/agentic tiers fall back DOWN (to
+    // cheaper models), not UP to Sonnet. Only code/reasoning tiers
+    // fall back through Sonnet before hitting DeepSeek.
+    //
+    //   reasoning -> code    -> cheap   (worth paying for Sonnet fallback)
+    //   code      -> cheap              (already Sonnet; skip to DeepSeek)
+    //   agentic   -> cheap              (MiMo fail? go cheap, not Sonnet)
+    //   cheap     -> agentic -> code    (DeepSeek fail? try MiMo, then Sonnet)
+    type FallbackLabel = "primary" | "fallback-sonnet" | "fallback-deepseek" | "fallback-mimo";
     const candidates: Array<{
       tier: typeof decision.tier;
       model: string;
       providerCfg: typeof provider;
-      label: "primary" | "fallback-sonnet" | "fallback-deepseek";
+      label: FallbackLabel;
     }> = [];
     const seen = new Set<string>();
     const push = (
       tier: typeof decision.tier,
-      label: "primary" | "fallback-sonnet" | "fallback-deepseek",
+      label: FallbackLabel,
     ) => {
       const entry = MODELS[tier];
       if (seen.has(entry.model)) return;
@@ -516,7 +520,13 @@ app.post("/v1/chat/completions", async (c) => {
       });
     };
     push(decision.tier, "primary");
-    push("code", "fallback-sonnet");
+    if (decision.tier === "reasoning" || decision.tier === "code") {
+      push("code", "fallback-sonnet");
+    }
+    if (decision.tier === "cheap") {
+      push("agentic", "fallback-mimo");
+      push("code", "fallback-sonnet");
+    }
     push("cheap", "fallback-deepseek");
 
     let lastResp: Response | null = null;

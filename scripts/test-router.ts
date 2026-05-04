@@ -65,6 +65,24 @@ const cases: Case[] = [
         { role: "user", content: "summarize the project" },
       ] } },
 
+  // --- conversational / cheap with tools ---
+  { name: "status report with tools = cheap", expect: "cheap",
+    req: { model: "gpt-4.1__shoutout",
+      tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
+      messages: [{ role: "user", content: "thanks, /kpi and /showkpi STILL only show 49 talent, but admin > shoutout fans shows 65 (correct)" }] } },
+  { name: "thanks acknowledgment = cheap", expect: "cheap",
+    req: { model: "gpt-4.1",
+      tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
+      messages: [{ role: "user", content: "thanks, looks good" }] } },
+  { name: "it's working now = cheap", expect: "cheap",
+    req: { model: "gpt-4.1",
+      tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
+      messages: [{ role: "user", content: "ok that's correct, it is working now" }] } },
+  { name: "action request stays agentic", expect: "agentic",
+    req: { model: "auto",
+      tools: [{ type: "function", function: { name: "search", parameters: {} } }],
+      messages: [{ role: "user", content: "find recent issues about auth" }] } },
+
   // --- aliases / passthrough ---
   { name: "alias: easy",   expect: "agentic",  req: { model: "easy",   messages: [{ role: "user", content: "hi" }] } },
   { name: "alias: code",   expect: "code",     req: { model: "code",   messages: [{ role: "user", content: "hi" }] } },

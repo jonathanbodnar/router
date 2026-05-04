@@ -159,6 +159,31 @@ const CODEY_TOKENS_RE =
 const DEV_TASK_RE =
   /\b(debug|fix (?:this|the|a) bug|stack ?trace|error|implement|refactor|unit ?test|integration ?test|code review|lint|type ?error|compile|build fail|regex|api endpoint|edit (?:this|the) file|write (?:a )?(?:function|component|hook|module|script))\b/i;
 
+/**
+ * Positive signals that a message is conversational / confirmatory and
+ * doesn't need an expensive model — even if Cursor attached 19 tools.
+ * Must be combined with the absence of code signals + short length.
+ */
+const CONVERSATIONAL_RE = new RegExp(
+  [
+    // acknowledgements / reactions
+    "^\\s*(?:thanks|thank you|thx|ty|ok(?:ay)?|yes|no|yep|yup|nope|sure|got it|noted|ack|confirmed?|roger|perfect|great|awesome|nice|cool|lgtm|looks? good|exactly|right|correct|that'?s? (?:right|correct|it)|good job|well done)",
+    // status reports
+    "\\bstill (?:show|shows|showing|only|not|doesn'?t|isn'?t|broken|wrong)\\b",
+    "\\b(?:shows?|displays?|returns?|gives?) (?:the (?:same|wrong|right|correct|old)|\\d)",
+    "\\bthat (?:works?|worked|fixed|broke|didn'?t)",
+    "\\bit(?:'?s| is) (?:working|fixed|broken|still|correct|wrong|the same)",
+    "\\bnow (?:it |this |the )?(?:works?|shows?|looks?|loads?)",
+    // simple yes/no questions about state
+    "\\b(?:is|are|does|did|was|were) (?:it|this|that|the) ",
+    // approval / closure
+    "\\bship it\\b",
+    "\\bmerge it\\b",
+    "\\blooks? (?:good|great|fine|correct|right)\\b",
+  ].join("|"),
+  "i",
+);
+
 const REASONING_RE = new RegExp(
   [
     // architecture / design
@@ -236,6 +261,9 @@ const REASONING_USER_MIN_TOKENS = 600; // user's ask must be substantive to
 //                                     // mention of "architecture" routes us
 //                                     // to a $0.30 reply.
 const MODERATE_CODE_USER_TOKENS = 1_500; // pasted-code threshold for Sonnet
+const CONVERSATIONAL_MAX_TOKENS = 60; // short msgs with conversational
+//                                    // signals go to cheap even with tools;
+//                                    // Cursor always sends 19 tools.
 
 /* ---------- main classifier ---------- */
 
@@ -299,10 +327,23 @@ function classify(req: IncomingRequest): RouteDecision {
     );
   }
 
-  // 4. Any tool-calling agent loop or code/dev hint -> MiMo.
-  //    This is the default for Cursor: every agent message has tools
-  //    attached, so without an explicit reasoning/code flag we run on
-  //    MiMo for cost.
+  // 4a. Short conversational/confirmatory message + tools but NO code
+  //     signals -> cheap. Cursor always sends ~19 tools even for "thanks"
+  //     or "looks good". Requires BOTH a conversational pattern match AND
+  //     a short message to avoid false positives on action requests like
+  //     "find recent issues about auth".
+  const looksConversational = CONVERSATIONAL_RE.test(userText);
+  if (!codeSignal && tools > 0 && looksConversational && userTokens < CONVERSATIONAL_MAX_TOKENS) {
+    return decide(
+      "cheap",
+      `conversational (no code signal, ~${userTokens} user tok, tools=${tools})`,
+    );
+  }
+
+  // 4b. Any tool-calling agent loop or code/dev hint -> MiMo.
+  //     This is the default for Cursor: every agent message has tools
+  //     attached, so without an explicit reasoning/code flag we run on
+  //     MiMo for cost.
   if (codeSignal || tools > 0) {
     const why = strongCodeSignal
       ? "code/dev signal in user msg"
