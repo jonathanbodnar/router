@@ -208,7 +208,11 @@ function classify(req: IncomingRequest): RouteDecision {
 
 /** Resolve the client's `model` field to a concrete upstream model id. */
 export function route(req: IncomingRequest): RouteDecision {
-  const requested = (req.model ?? "auto").trim();
+  // Project tags (model name "gpt-4.1__router") are stripped before
+  // routing so classification only sees the base model name.
+  const rawModel = (req.model ?? "auto").trim();
+  const tagSep = rawModel.indexOf("__");
+  const requested = tagSep === -1 ? rawModel : rawModel.slice(0, tagSep);
 
   // Passthrough for fully-qualified model ids. Provider is inferred from
   // the id ("accounts/fireworks/..." -> Fireworks; everything else -> OR).

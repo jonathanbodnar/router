@@ -1,7 +1,11 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { resolveProject, resolveWorkType } from "./classify.js";
+import {
+  parseModelProjectTag,
+  resolveProject,
+  resolveWorkType,
+} from "./classify.js";
 import { mountDashboard } from "./dashboard.js";
 import { recordCall } from "./db.js";
 import { computeCost } from "./pricing.js";
@@ -240,8 +244,18 @@ app.post("/v1/chat/completions", async (c) => {
     console.log(
       `[req] keys=[${keys.join(",")}] messages=${msgs} ` +
         `has_input=${"input" in rawBody} has_prompt=${"prompt" in rawBody} ` +
-        `has_instructions=${"instructions" in rawBody}`,
+        `has_instructions=${"instructions" in rawBody} ` +
+        `headers=[${[...c.req.raw.headers.keys()].join(",")}]`,
     );
+  }
+  // Opt-in full-body dump for one-off debugging. Set ROUTER_LOG_BODY=1 in
+  // Railway, send a few requests, then unset it again.
+  if (process.env.ROUTER_LOG_BODY === "1") {
+    try {
+      console.log("[body]", JSON.stringify(rawBody).slice(0, 4000));
+    } catch {
+      console.log("[body] <unserialisable>");
+    }
   }
 
   const { body: normalisedBody, adapted } = normaliseBody(rawBody);
@@ -254,7 +268,12 @@ app.post("/v1/chat/completions", async (c) => {
   const decision = route(body);
   const provider = PROVIDERS[decision.provider];
   const requestedModel = (body.model ?? "auto").toString();
-  const project = resolveProject(c.req.header("x-router-project"), body);
+  const { project: modelProjectTag } = parseModelProjectTag(requestedModel);
+  const project = resolveProject(
+    c.req.header("x-router-project"),
+    modelProjectTag,
+    body,
+  );
   const workType = resolveWorkType(c.req.header("x-router-work-type"), body);
   const isStream = body.stream === true;
 

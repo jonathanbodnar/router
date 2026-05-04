@@ -92,6 +92,13 @@ const cases: Array<{ name: string; req: Parameters<typeof route>[0] }> = [
       messages: [{ role: "user", content: "hi" }],
     },
   },
+  {
+    name: "model name with project tag",
+    req: {
+      model: "gpt-4.1__router",
+      messages: [{ role: "user", content: "hi" }],
+    },
+  },
 ];
 
 for (const c of cases) {

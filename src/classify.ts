@@ -106,13 +106,40 @@ export function detectWorkType(req: IncomingRequest): WorkType {
   return "other";
 }
 
-/** Allow direct API users to override via headers. */
+/**
+ * Extract a project tag from a model name of the form `<base>__<project>`.
+ * Returns the project (or null) and the base model name with the tag
+ * stripped so downstream classification only sees the base.
+ *
+ * Example: "gpt-4.1__router" -> { base: "gpt-4.1", project: "router" }
+ *          "gpt-4.1"         -> { base: "gpt-4.1", project: null }
+ */
+export function parseModelProjectTag(model: string | undefined): {
+  base: string;
+  project: string | null;
+} {
+  const m = (model ?? "").trim();
+  const idx = m.indexOf("__");
+  if (idx === -1) return { base: m, project: null };
+  const base = m.slice(0, idx);
+  const tag = m.slice(idx + 2).trim();
+  return { base, project: tag.length > 0 ? tag : null };
+}
+
+/**
+ * Resolve the project tag for a request. Precedence:
+ *   1. X-Router-Project header (if present)
+ *   2. Project tag baked into the model name (`gpt-4.1__router`)
+ *   3. Heuristic detection from message content
+ */
 export function resolveProject(
   headerValue: string | undefined,
+  modelTag: string | null,
   req: IncomingRequest,
 ): string | null {
-  const v = headerValue?.trim();
-  if (v) return v;
+  const h = headerValue?.trim();
+  if (h) return h;
+  if (modelTag) return modelTag;
   return detectProject(req);
 }
 

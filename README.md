@@ -53,7 +53,7 @@ Every chat-completion request writes one row to `calls` in SQLite:
 | --- | --- |
 | `routed_model`, `tier` | what we actually called on OpenRouter |
 | `requested_model` | what the client asked for (`auto`, alias, model id) |
-| `project` | detected from Cursor's `Workspace Path: …` system block, or the `X-Router-Project` header |
+| `project` | resolved (in order) from: 1) `X-Router-Project` header, 2) a `__project` suffix on the model name (e.g. `gpt-4.1__router`), 3) heuristic detection from message content (looks for Cursor's `Workspace Path: …` block when present) |
 | `work_type` | one of `bug_fix` / `rework` / `new_feature` / `other`, heuristic on the last user message; or `X-Router-Work-Type` header |
 | `prompt_tokens`, `completion_tokens`, `total_tokens` | from each provider's `usage` (we inject `usage: { include: true }` for OpenRouter) |
 | `cost_usd` | from `usage.cost` for OpenRouter (what your account is actually billed); computed locally from `src/pricing.ts` for Fireworks (Fireworks doesn't return cost in the response) |
@@ -71,7 +71,7 @@ data refreshes every 15 seconds.
 
 ### Tagging requests from outside Cursor
 
-Direct API users can label calls explicitly:
+Direct API users can label calls explicitly via headers:
 
 ```bash
 curl https://your-app.up.railway.app/v1/chat/completions \
@@ -84,6 +84,27 @@ curl https://your-app.up.railway.app/v1/chat/completions \
 
 Accepted `x-router-work-type` values: `bug_fix` (or `bug`/`fix`),
 `rework` (or `refactor`), `new_feature` (or `feature`/`new`), `other`.
+
+### Tagging requests from Cursor (per-project)
+
+Cursor's BYOK proxy strips its `Workspace Path:` system block before
+forwarding to your custom URL, so heuristic project detection won't work
+for Cursor traffic. Instead, **encode the project in the model name**
+using a `__` separator:
+
+| Cursor model name | Routing | Project tag |
+| --- | --- | --- |
+| `gpt-4.1` | auto-classified | _(none — falls back to heuristic / null)_ |
+| `gpt-4.1__router` | auto-classified | `router` |
+| `gpt-4.1__shopapp` | auto-classified | `shopapp` |
+| `gpt-4.1__marketing` | auto-classified | `marketing` |
+
+Cursor lets you add as many custom models as you want under one base URL;
+add one entry per project, then pick the right one in the model selector
+of each chat. The base before `__` is what Cursor's allowlist sees and
+what we use for routing — so all of `gpt-4.1__*` route exactly the same
+as plain `gpt-4.1`. Only the `_router` debug field and the dashboard
+project breakdown change.
 
 ## Local dev
 
@@ -141,10 +162,13 @@ In Cursor: **Settings &rarr; Models &rarr; OpenAI API Key**:
 - **OpenAI API Key**: paste your `ROUTER_API_KEY`.
 - Expand **Override OpenAI Base URL** and set it to:
   `https://your-app.up.railway.app/v1`
-- Click **Verify**.
-- Under **Models**, add a custom model named `auto` (and optionally
-  `cheap`, `agentic`, `code`, `reasoning`). Disable any built-in models you
-  don't want Cursor to use directly so it always goes through the router.
+- Click **Verify** (only once — multiple clicks can trip Cursor's local rate
+  limiter).
+- Under **Models**, add custom models named after Cursor's allowed list
+  (most reliably `gpt-4.1`). Optionally add tagged variants per project,
+  e.g. `gpt-4.1__router`, `gpt-4.1__shopapp` — see "Tagging requests from
+  Cursor" above. Disable Cursor's built-in models so all chat traffic goes
+  through the router.
 
 From here on, Cursor sends every request to your Railway service, which:
 1. Picks the right OpenRouter model per request,
