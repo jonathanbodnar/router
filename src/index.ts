@@ -11,6 +11,7 @@ import {
 import { mountDashboard } from "./dashboard.js";
 import { recordCall } from "./db.js";
 import { DEFAULT_CONFIG as CLASSIFIER_CFG, maybeUpgradeWithLLM } from "./llm-classifier.js";
+import { normaliseBody } from "./normalise.js";
 import { computeCost } from "./pricing.js";
 import { loadProviders, type Provider } from "./providers.js";
 import { MODELS, route, type IncomingRequest } from "./router.js";
@@ -141,64 +142,6 @@ function withUsageIncluded(body: IncomingRequest): IncomingRequest {
  * Returns the normalised body and a list of source-field names we adapted
  * from (for logging).
  */
-function normaliseBody(
-  body: Record<string, unknown>,
-): { body: Record<string, unknown>; adapted: string[] } {
-  const adapted: string[] = [];
-  const messagesPresent =
-    Array.isArray(body.messages) && (body.messages as unknown[]).length > 0;
-  if (messagesPresent) return { body, adapted };
-
-  const messages: Array<{ role: string; content: string }> = [];
-
-  // Responses API: top-level `instructions` becomes a system message.
-  if (typeof body.instructions === "string" && body.instructions.length > 0) {
-    messages.push({ role: "system", content: body.instructions });
-    adapted.push("instructions");
-  }
-  // Some clients use `system` directly.
-  if (typeof body.system === "string" && body.system.length > 0) {
-    messages.push({ role: "system", content: body.system });
-    adapted.push("system");
-  }
-
-  // Responses API: `input` may be a string or an array of typed parts.
-  if (typeof body.input === "string" && body.input.length > 0) {
-    messages.push({ role: "user", content: body.input });
-    adapted.push("input");
-  } else if (Array.isArray(body.input)) {
-    const text = (body.input as Array<Record<string, unknown>>)
-      .map((p) =>
-        typeof p?.text === "string"
-          ? p.text
-          : typeof p?.content === "string"
-            ? p.content
-            : "",
-      )
-      .filter(Boolean)
-      .join("\n");
-    if (text) {
-      messages.push({ role: "user", content: text });
-      adapted.push("input[]");
-    }
-  }
-
-  // Legacy completions: `prompt` is a plain string.
-  if (typeof body.prompt === "string" && body.prompt.length > 0) {
-    messages.push({ role: "user", content: body.prompt });
-    adapted.push("prompt");
-  }
-
-  if (messages.length > 0) {
-    const out: Record<string, unknown> = { ...body, messages };
-    delete out.input;
-    delete out.instructions;
-    delete out.system;
-    delete out.prompt;
-    return { body: out, adapted };
-  }
-  return { body, adapted };
-}
 
 /**
  * Compute cost for a finished call. For providers that return cost in
@@ -262,8 +205,15 @@ app.post("/v1/chat/completions", async (c) => {
   }
 
   const { body: normalisedBody, adapted } = normaliseBody(rawBody);
+  // Always log when we translate flat tools — strict upstreams (sglang
+  // behind MiMo, certain Anthropic providers) reject the flat shape, so
+  // this line is the proof-point that the fix kicked in. Other adaptations
+  // are still gated behind ROUTER_LOG_UPSTREAM.
+  if (adapted.includes("tools(flat->nested)")) {
+    console.log(`[normalise] translated flat tools -> nested for upstream`);
+  }
   if (log && adapted.length > 0) {
-    console.log(`[normalise] adapted fields: ${adapted.join(", ")} -> messages`);
+    console.log(`[normalise] adapted fields: ${adapted.join(", ")}`);
   }
 
   let body = normalisedBody as IncomingRequest;
