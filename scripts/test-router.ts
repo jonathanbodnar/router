@@ -43,9 +43,27 @@ const cases: Case[] = [
   // --- hard / reasoning / Opus ---
   { name: "architecture review (substantial)", expect: "reasoning",
     req: { model: "auto", messages: [{ role: "user", content:
-      "I'm doing a complex refactor of our distributed system architecture. " +
-      "Deeply analyze the trade-offs between event sourcing and CRUD for our billing service. " +
-      "Context: ".padEnd(28000, "x") }] } },
+      ("I'm doing a complex refactor of our distributed system architecture. " +
+       "Deeply analyze the trade-offs between event sourcing and CRUD for our billing service. " +
+       "Walk me through the migration plan, the rollback strategy, and how we'd handle the " +
+       "consistency model across services. ").repeat(20) }] } },
+
+  // --- regression: short user msg + Cursor's giant system prompt should
+  //     NOT route to Opus. Reproduces the "summarize the project" case
+  //     that cost $0.30/call on the dashboard.
+  { name: "regression: short ask, huge Cursor system prompt", expect: "agentic",
+    req: { model: "gpt-4.1__shoutout",
+      tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
+      messages: [
+        // System prompt that contains every reasoning-flavored phrase
+        // we have in REASONING_RE — this is a reasonable approximation
+        // of Cursor's stock prompt + agent skills + workspace metadata.
+        { role: "system", content:
+          "You are a coding agent. Document architectural decisions and design reviews. " +
+          "Walk through complex refactors step by step. Watch out for race conditions, " +
+          "thread safety, and other concurrency bugs. Be production-grade. ".repeat(200) },
+        { role: "user", content: "summarize the project" },
+      ] } },
 
   // --- aliases / passthrough ---
   { name: "alias: easy",   expect: "agentic",  req: { model: "easy",   messages: [{ role: "user", content: "hi" }] } },

@@ -119,6 +119,27 @@ function fullText(req: IncomingRequest): string {
   return (req.messages ?? []).map(messageText).join("\n");
 }
 
+/**
+ * Text of the latest user-role message. This — not the entire conversation
+ * — is what we run keyword heuristics against.
+ *
+ * Cursor's stock agent system prompt + workspace metadata + previous
+ * assistant turns + tool-result blobs can easily total 5k–30k tokens and
+ * routinely contain language that matches the reasoning / code regexes
+ * for completely unrelated reasons. If we let those decide the tier we'd
+ * route trivial asks like "summarize the project" to Opus. By pinning
+ * keyword detection to the user's actual ask, we keep the heuristic
+ * honest and let total-token thresholds handle "long context bulk"
+ * separately.
+ */
+function lastUserText(req: IncomingRequest): string {
+  const msgs = req.messages ?? [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.role === "user") return messageText(msgs[i]!);
+  }
+  return "";
+}
+
 /** Cheap, deterministic token estimate (~4 chars / token). */
 function approxTokens(text: string): number {
   if (!text) return 0;
@@ -195,19 +216,31 @@ const REASONING_RE = new RegExp(
   "i",
 );
 
-/** Heuristic token thresholds, tuned for Cursor-style traffic. */
-const LONG_CONTEXT_TOKENS = 32_000; // bulk-doc threshold for MiMo when no tools
-const REASONING_MIN_TOKENS = 6_000; // big bump: Cursor's stock system prompts
-//                                  // routinely cross 1.5k. Require real
-//                                  // substance before paying Opus prices.
-const MODERATE_CODE_TOKENS = 5_000; // above this, code work goes to Sonnet not MiMo
-const CODE_MIN_TOKENS = 200;
+/**
+ * Heuristic thresholds, tuned for Cursor-style traffic.
+ *
+ * Decisions are split into two axes:
+ *   - keyword/regex signals — measured ONLY against the user's latest
+ *     message (`userTokens`), to prevent Cursor's stock system prompt
+ *     from biasing every request toward Opus.
+ *   - bulk / long-context — measured against the entire context
+ *     (`totalTokens`), because that's what determines whether MiMo's
+ *     long context wins.
+ */
+const LONG_CONTEXT_TOKENS = 32_000; // total-context bulk threshold (MiMo)
+const REASONING_USER_MIN_TOKENS = 600; // user's ask must be substantive to
+//                                     // warrant Opus, otherwise a 5-token
+//                                     // mention of "architecture" routes us
+//                                     // to a $0.30 reply.
+const MODERATE_CODE_USER_TOKENS = 1_500; // pasted-code threshold for Sonnet
 
 /* ---------- main classifier ---------- */
 
 function classify(req: IncomingRequest): RouteDecision {
-  const text = fullText(req);
-  const tokens = approxTokens(text);
+  const allText = fullText(req);
+  const totalTokens = approxTokens(allText);
+  const userText = lastUserText(req);
+  const userTokens = approxTokens(userText);
   const tools = Array.isArray(req.tools) ? req.tools.length : 0;
 
   const decide = (tier: Tier, reason: string): RouteDecision => ({
@@ -215,63 +248,72 @@ function classify(req: IncomingRequest): RouteDecision {
     provider: MODELS[tier].provider,
     model: MODELS[tier].model,
     reason,
-    approxInputTokens: tokens,
+    // We report TOTAL tokens for billing/context display, even though
+    // routing decisions key on userTokens for keyword signals.
+    approxInputTokens: totalTokens,
   });
 
-  const hasCodeFence = CODE_FENCE_RE.test(text);
+  // Keyword signals: pinned to the user's latest message ONLY.
+  const hasCodeFence = CODE_FENCE_RE.test(userText);
   CODE_FENCE_RE.lastIndex = 0;
-  const hasFilePath = FILE_PATH_RE.test(text);
-  const hasDevVerb = DEV_TASK_RE.test(text);
-  const hasCodeyTokens = CODEY_TOKENS_RE.test(text);
+  const hasFilePath = FILE_PATH_RE.test(userText);
+  const hasDevVerb = DEV_TASK_RE.test(userText);
+  const hasCodeyTokens = CODEY_TOKENS_RE.test(userText);
+  const looksReasoning = REASONING_RE.test(userText);
 
-  // Strong code signals: any one of these is enough on its own, regardless
-  // of length. A fence, an explicit file path, or a dev verb means the
-  // user is clearly doing dev work.
   const strongCodeSignal = hasCodeFence || hasFilePath || hasDevVerb;
   const weakCodeSignal = hasCodeyTokens;
   const codeSignal = strongCodeSignal || weakCodeSignal;
-  const looksReasoning = REASONING_RE.test(text);
 
   // 1. Highest-stakes reasoning / architecture -> Opus.
-  //    Require both a reasoning signal AND meaningful substance; casual
-  //    mentions of "architecture" alone shouldn't blow the budget.
-  if (looksReasoning && tokens >= REASONING_MIN_TOKENS) {
+  //    Require BOTH a reasoning regex hit in the user's latest message
+  //    AND that user message to be substantive. This is intentionally
+  //    strict; pair it with the LLM classifier (cheap upgrade pass) and
+  //    explicit `!hard` / `[opus]` overrides for the cases where the user
+  //    asks something genuinely hard in a short prompt.
+  if (looksReasoning && userTokens >= REASONING_USER_MIN_TOKENS) {
     return decide(
       "reasoning",
-      `reasoning/architecture signal (~${tokens} tok)`,
+      `reasoning signal in user msg (~${userTokens} user tok / ${totalTokens} total)`,
     );
   }
 
-  // 2. Long-context bulk work with NO tools -> MiMo (1M context, cheap).
-  //    Pasted-doc summarisation, big code reads, etc.
-  if (tools === 0 && tokens >= LONG_CONTEXT_TOKENS) {
-    return decide("agentic", `long context (~${tokens} tok, no tools)`);
+  // 2. Long-context bulk with NO tools -> MiMo (cheap 1M ctx).
+  //    Pasted-doc summarisation, repo-wide reads, etc. Total context
+  //    matters here, not user-message length.
+  if (tools === 0 && totalTokens >= LONG_CONTEXT_TOKENS) {
+    return decide("agentic", `long context (~${totalTokens} tok, no tools)`);
   }
 
-  // 3. Substantial code work -> Sonnet (moderate dev tier).
-  //    Strong code signals + meaningful prompt size means the user is
-  //    asking for non-trivial dev work; lean on Sonnet for quality.
-  if (strongCodeSignal && tokens >= MODERATE_CODE_TOKENS) {
+  // 3. Pasted code / substantial dev request -> Sonnet (moderate tier).
+  //    Strong code signal in the user's message AND the user's message
+  //    is itself meaty (~1.5k tokens of pasted code or dense dev spec).
+  //    Short asks like "fix the typo in foo.ts" stay on MiMo by default.
+  if (strongCodeSignal && userTokens >= MODERATE_CODE_USER_TOKENS) {
     return decide(
       "code",
-      `substantial code work (~${tokens} tok, tools=${tools})`,
+      `substantial code request (~${userTokens} user tok, tools=${tools})`,
     );
   }
 
-  // 4. Easy/medium dev work and short tool-calling -> MiMo.
-  //    Quick changes, simple debugging, day-to-day Cursor coding. MiMo
-  //    handles tools natively.
+  // 4. Any tool-calling agent loop or code/dev hint -> MiMo.
+  //    This is the default for Cursor: every agent message has tools
+  //    attached, so without an explicit reasoning/code flag we run on
+  //    MiMo for cost.
   if (codeSignal || tools > 0) {
     const why = strongCodeSignal
-      ? "code/dev signal"
-      : weakCodeSignal && tokens >= CODE_MIN_TOKENS
-        ? "code-ish prose"
+      ? "code/dev signal in user msg"
+      : weakCodeSignal
+        ? "code-ish prose in user msg"
         : "tool-calling request";
-    return decide("agentic", `${why} (~${tokens} tok, tools=${tools})`);
+    return decide(
+      "agentic",
+      `${why} (~${userTokens} user tok, tools=${tools})`,
+    );
   }
 
-  // 5. Default: non-dev / general-purpose -> DeepSeek (cheap).
-  return decide("cheap", `general/short prompt (~${tokens} tok)`);
+  // 5. Default: short non-dev prompt -> DeepSeek (cheapest).
+  return decide("cheap", `general/short prompt (~${userTokens} user tok)`);
 }
 
 /** Resolve the client's `model` field to a concrete upstream model id. */
