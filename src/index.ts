@@ -262,6 +262,23 @@ app.post("/v1/chat/completions", async (c) => {
   //    BEFORE classification so the heuristic and LLM classifier never see
   //    the override tag and can't get confused by it.
   let promptOverrideAlias: string | null = null;
+  if (log) {
+    // Debug: show what the last user message actually looks like so we can
+    // tell why an override tag might not be matching.
+    const msgs = body.messages ?? [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i]?.role === "user") {
+        const c = msgs[i]!.content;
+        const preview = typeof c === "string"
+          ? c.slice(0, 120)
+          : Array.isArray(c)
+            ? c.map((p: Record<string, unknown>) => typeof p?.text === "string" ? (p.text as string) : "").join("").slice(0, 120)
+            : "(no content)";
+        console.log(`[override-dbg] last user msg (first 120): ${JSON.stringify(preview)}`);
+        break;
+      }
+    }
+  }
   const override = parsePromptOverride(body);
   if (override) {
     promptOverrideAlias = override.alias;
