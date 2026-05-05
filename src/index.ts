@@ -733,113 +733,127 @@ app.post("/v1/chat/completions", async (c) => {
 
   if (needsHeartbeat) {
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    let streamCancelled = false;
     const clearHB = () => {
       if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
     };
 
-    const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        const encoder = new TextEncoder();
-        let lastContentMs = 0;
-        let recorded = false;
-        const recordOnce = (status: number, err: string | null) => {
-          if (recorded) return;
-          recorded = true;
-          finalize(status, err);
-        };
+    const encoder = new TextEncoder();
+    let lastContentMs = 0;
+    let recorded = false;
+    const recordOnce = (status: number, err: string | null) => {
+      if (recorded) return;
+      recorded = true;
+      finalize(status, err);
+    };
 
-        const emitHeartbeat = () => {
-          if (lastContentMs && Date.now() - lastContentMs < HEARTBEAT_MS) return;
-          const hb = JSON.stringify({
-            id: `hb-${Date.now()}`,
+    // Controller reference — set synchronously inside start().
+    let ctrl: ReadableStreamDefaultController<Uint8Array>;
+
+    const emitHeartbeat = () => {
+      if (streamCancelled) { clearHB(); return; }
+      if (lastContentMs && Date.now() - lastContentMs < HEARTBEAT_MS) return;
+      const hb = JSON.stringify({
+        id: `hb-${Date.now()}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: requestedModel,
+        choices: [{
+          index: 0,
+          delta: { role: "assistant", content: " " },
+          finish_reason: null,
+        }],
+      });
+      try { ctrl.enqueue(encoder.encode(`data: ${hb}\n\n`)); }
+      catch { clearHB(); }
+    };
+
+    // Detached async function that fetches upstream and pipes
+    // chunks into the controller. Runs independently of start().
+    async function pipeUpstream() {
+      try {
+        const upstreamResp = await callUpstreamWithFallback();
+
+        if (streamCancelled) { clearHB(); return; }
+
+        if (!upstreamResp.ok || !upstreamResp.body) {
+          clearHB();
+          const text = await upstreamResp.text();
+          console.error(
+            `[upstream:${actualProvider.name}] ${upstreamResp.status} (hb-stream) body=${text.slice(0, 800)}`,
+          );
+          const errChunk = JSON.stringify({
+            id: `err-${Date.now()}`,
             object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
             model: requestedModel,
             choices: [{
               index: 0,
-              delta: { role: "assistant", content: " " },
-              finish_reason: null,
+              delta: { content: `\n[upstream error: ${upstreamResp.status}]` },
+              finish_reason: "stop",
             }],
           });
-          try { controller.enqueue(encoder.encode(`data: ${hb}\n\n`)); }
-          catch { /* stream closed */ }
-        };
-
-        // Fire first heartbeat IMMEDIATELY so Cursor sees content
-        // before its ~3s timeout, then repeat every 1.5s.
-        // Heartbeats continue for the ENTIRE stream, but skip
-        // when real content flowed recently (within HEARTBEAT_MS).
-        emitHeartbeat();
-        heartbeatTimer = setInterval(emitHeartbeat, HEARTBEAT_MS);
-
-        try {
-          // Fetch upstream INSIDE the stream — the response is already
-          // flowing to Cursor with heartbeats while we wait for MiMo.
-          const upstreamResp = await callUpstreamWithFallback();
-
-          if (!upstreamResp.ok || !upstreamResp.body) {
-            clearHB();
-            const text = await upstreamResp.text();
-            console.error(
-              `[upstream:${actualProvider.name}] ${upstreamResp.status} (hb-stream) body=${text.slice(0, 800)}`,
-            );
-            const errChunk = JSON.stringify({
-              id: `err-${Date.now()}`,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: requestedModel,
-              choices: [{
-                index: 0,
-                delta: { content: `\n[upstream error: ${upstreamResp.status}]` },
-                finish_reason: "stop",
-              }],
-            });
-            controller.enqueue(encoder.encode(`data: ${errChunk}\n\ndata: [DONE]\n\n`));
-            recordOnce(upstreamResp.status, text.slice(0, 500));
-            controller.close();
-            return;
-          }
-
-          const reader = upstreamResp.body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = "";
-
-          for (;;) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-
-            let sep: number;
-            while ((sep = buffer.indexOf("\n\n")) !== -1) {
-              const rawEvent = buffer.slice(0, sep);
-              buffer = buffer.slice(sep + 2);
-              const rewritten = rewriteSseEvent(
-                rawEvent, requestedModel, usage, captured,
-              );
-              if (rewritten.includes('"content":"') &&
-                  !rewritten.includes('"content":""')) {
-                lastContentMs = Date.now();
-              }
-              controller.enqueue(encoder.encode(rewritten + "\n\n"));
-            }
-          }
-          clearHB();
-          if (buffer.length > 0) {
-            controller.enqueue(encoder.encode(
-              rewriteSseEvent(buffer, requestedModel, usage, captured),
-            ));
-          }
-          finalizeCost(actualProvider.name, actualModel, usage);
-          recordOnce(200, null);
-        } catch (err) {
-          clearHB();
-          console.error("[stream] error:", err);
-          controller.error(err);
+          ctrl.enqueue(encoder.encode(`data: ${errChunk}\n\ndata: [DONE]\n\n`));
+          recordOnce(upstreamResp.status, text.slice(0, 500));
+          ctrl.close();
           return;
         }
-        controller.close();
+
+        const reader = upstreamResp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        for (;;) {
+          if (streamCancelled) { reader.cancel(); clearHB(); return; }
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          let sep: number;
+          while ((sep = buffer.indexOf("\n\n")) !== -1) {
+            const rawEvent = buffer.slice(0, sep);
+            buffer = buffer.slice(sep + 2);
+            const rewritten = rewriteSseEvent(
+              rawEvent, requestedModel, usage, captured,
+            );
+            if (rewritten.includes('"content":"') &&
+                !rewritten.includes('"content":""')) {
+              lastContentMs = Date.now();
+            }
+            ctrl.enqueue(encoder.encode(rewritten + "\n\n"));
+          }
+        }
+        clearHB();
+        if (buffer.length > 0) {
+          ctrl.enqueue(encoder.encode(
+            rewriteSseEvent(buffer, requestedModel, usage, captured),
+          ));
+        }
+        finalizeCost(actualProvider.name, actualModel, usage);
+        recordOnce(200, null);
+      } catch (err) {
+        clearHB();
+        if (streamCancelled) return;
+        console.error("[stream] error:", err);
+        try { ctrl.error(err); } catch { /* already closed */ }
+        return;
+      }
+      try { ctrl.close(); } catch { /* already closed */ }
+    }
+
+    const stream = new ReadableStream<Uint8Array>({
+      // CRITICAL: start() is synchronous — returns void, NOT a
+      // Promise. This lets enqueued heartbeats flush to the HTTP
+      // response immediately instead of being held until an async
+      // start() promise resolves.
+      start(controller) {
+        ctrl = controller;
+        emitHeartbeat();
+        heartbeatTimer = setInterval(emitHeartbeat, HEARTBEAT_MS);
+        pipeUpstream();
       },
       cancel(reason) {
+        streamCancelled = true;
         clearHB();
         if (log) console.log("[stream] cancelled:", reason);
       },
