@@ -109,6 +109,20 @@ const cases: Case[] = [
       tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
       messages: [{ role: "user", content: "this is a large complex project from scratch, build the full payment system" }] } },
 
+  // --- MiMo context cap: huge agentic context -> Sonnet ---
+  { name: "MiMo cap: huge context + tools = Sonnet", expect: "code",
+    req: { model: "gpt-4.1__RevOs",
+      tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
+      messages: [
+        { role: "user", content: "I want to use supabase for the DB" },
+        // 8+ minutes of prior tool results = massive context
+        { role: "assistant", content: "building schema... " + "lorem ipsum ".repeat(20000) },
+        { role: "tool", content: "file output: " + "code line\n".repeat(15000), tool_call_id: "t1" },
+        { role: "assistant", content: "continuing... " + "code ".repeat(15000) },
+        { role: "tool", content: "result: " + "data ".repeat(15000), tool_call_id: "t2" },
+        { role: "user", content: "I want to use supabase for the DB" },
+      ] } },
+
   // --- $93 regression: Opus with huge growing context -> downgrade to Sonnet ---
   // Once the agent loop is deep (100K+ tokens), we're doing implementation
   // work. Downgrade from Opus to Sonnet even if the original message asked

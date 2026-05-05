@@ -314,6 +314,13 @@ const CONVERSATIONAL_MAX_TOKENS = 60;  // short msgs with conversational
 // Users who genuinely need Opus on a massive context can use !hard / [opus].
 const OPUS_MAX_CONTEXT_TOKENS = 60_000;
 
+// Above this total-context size, downgrade MiMo -> Sonnet for agentic/tool
+// requests. MiMo's thinking time scales with context — a 300K-token context
+// causes MiMo to think for 60-120s between tokens, long enough that even
+// heartbeats can't prevent Cursor from abandoning the stream. Sonnet handles
+// large contexts reliably and produces better code at that scale anyway.
+const MIMO_MAX_CONTEXT_TOKENS = 120_000;
+
 /* ---------- main classifier ---------- */
 
 function classify(req: IncomingRequest): RouteDecision {
@@ -426,7 +433,19 @@ function classify(req: IncomingRequest): RouteDecision {
   //     This is the default for Cursor: every agent message has tools
   //     attached, so without an explicit reasoning/code flag we run on
   //     MiMo for cost.
+  //
+  //     CONTEXT-SIZE GUARD: once the agent loop has been running for many
+  //     turns, the growing context (tool results, generated files, history)
+  //     pushes MiMo's thinking time to 60-120s between tokens. That's too
+  //     long even with heartbeats — Cursor eventually abandons the stream.
+  //     Upgrade to Sonnet above 120K tokens: faster, more reliable at scale.
   if (codeSignal || tools > 0) {
+    if (totalTokens > MIMO_MAX_CONTEXT_TOKENS) {
+      return decide(
+        "code",
+        `context too large for MiMo (${totalTokens} tok > ${MIMO_MAX_CONTEXT_TOKENS} cap) -> Sonnet`,
+      );
+    }
     const why = strongCodeSignal
       ? "code/dev signal in user msg"
       : weakCodeSignal
