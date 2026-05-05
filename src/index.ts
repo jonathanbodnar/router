@@ -750,9 +750,12 @@ app.post("/v1/chat/completions", async (c) => {
     // Controller reference — set synchronously inside start().
     let ctrl: ReadableStreamDefaultController<Uint8Array>;
 
+    let hbCount = 0;
     const emitHeartbeat = () => {
       if (streamCancelled) { clearHB(); return; }
       if (lastContentMs && Date.now() - lastContentMs < HEARTBEAT_MS) return;
+      hbCount++;
+      if (log) console.log(`[heartbeat] #${hbCount} sent (lastContentMs=${lastContentMs}, seenContent=${lastContentMs > 0})`);
       const hb = JSON.stringify({
         id: `hb-${Date.now()}`,
         object: "chat.completion.chunk",
@@ -765,7 +768,7 @@ app.post("/v1/chat/completions", async (c) => {
         }],
       });
       try { ctrl.enqueue(encoder.encode(`data: ${hb}\n\n`)); }
-      catch { clearHB(); }
+      catch (e) { console.log(`[heartbeat] enqueue failed (stream closed?):`, e); clearHB(); }
     };
 
     // Detached async function that fetches upstream and pipes
@@ -775,6 +778,7 @@ app.post("/v1/chat/completions", async (c) => {
         const upstreamResp = await callUpstreamWithFallback();
 
         if (streamCancelled) { clearHB(); return; }
+        if (log) console.log(`[heartbeat] upstream connected after ${Date.now() - startedAt}ms, sent ${hbCount} HBs so far`);
 
         if (!upstreamResp.ok || !upstreamResp.body) {
           clearHB();
@@ -816,10 +820,11 @@ app.post("/v1/chat/completions", async (c) => {
             const rewritten = rewriteSseEvent(
               rawEvent, requestedModel, usage, captured,
             );
-            if (rewritten.includes('"content":"') &&
-                !rewritten.includes('"content":""')) {
-              lastContentMs = Date.now();
-            }
+              if (rewritten.includes('"content":"') &&
+                  !rewritten.includes('"content":""')) {
+                if (!lastContentMs && log) console.log(`[heartbeat] first real content at ${Date.now() - startedAt}ms after ${hbCount} HBs`);
+                lastContentMs = Date.now();
+              }
             ctrl.enqueue(encoder.encode(rewritten + "\n\n"));
           }
         }
@@ -848,6 +853,7 @@ app.post("/v1/chat/completions", async (c) => {
       // start() promise resolves.
       start(controller) {
         ctrl = controller;
+        if (log) console.log(`[heartbeat] stream opened for ${actualModel}, firing first HB immediately`);
         emitHeartbeat();
         heartbeatTimer = setInterval(emitHeartbeat, HEARTBEAT_MS);
         pipeUpstream();
@@ -855,7 +861,7 @@ app.post("/v1/chat/completions", async (c) => {
       cancel(reason) {
         streamCancelled = true;
         clearHB();
-        if (log) console.log("[stream] cancelled:", reason);
+        console.log(`[heartbeat] stream CANCELLED after ${hbCount} HBs, reason:`, reason);
       },
     });
 
