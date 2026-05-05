@@ -343,6 +343,7 @@ app.post("/v1/chat/completions", async (c) => {
       `[route] requested="${requestedModel}" -> ${decision.provider}:${decision.model} ` +
         `(${decision.tier}; ${decision.reason}) ` +
         `effort=${reasoningEffort} ` +
+        `ctx=${decision.approxInputTokens}tok ` +
         `project=${project ?? "-"} work_type=${workType} stream=${isStream}`,
     );
   }
@@ -771,14 +772,34 @@ app.post("/v1/chat/completions", async (c) => {
       catch (e) { console.log(`[heartbeat] enqueue failed (stream closed?):`, e); clearHB(); }
     };
 
+    // If the upstream model connects but produces no real content for this
+    // many ms, abort it and retry with Sonnet directly. Prevents MiMo queue
+    // back-pressure from causing 60-80s hangs that kill Cursor's subagents.
+    const FIRST_CONTENT_TIMEOUT_MS = 25_000;
+
     // Detached async function that fetches upstream and pipes
     // chunks into the controller. Runs independently of start().
-    async function pipeUpstream() {
+    // Pass `forceModel` to bypass callUpstreamWithFallback and hit a
+    // specific model directly (used for the content-timeout fallback).
+    async function pipeUpstream(forceModel?: { model: string; tier: typeof decision.tier }) {
       try {
-        const upstreamResp = await callUpstreamWithFallback();
+        let upstreamResp: Response;
+        if (forceModel) {
+          const entry = MODELS[forceModel.tier];
+          const pCfg = PROVIDERS[entry.provider];
+          const reqOut = buildUpstreamRequest(pCfg, forceModel.model);
+          actualProvider = pCfg;
+          actualModel = forceModel.model;
+          actualTier = forceModel.tier;
+          fellBackTo = `${pCfg.name}:${forceModel.model} (content-timeout-fallback)`;
+          upstreamResp = await fetch(reqOut.url, reqOut.init);
+        } else {
+          upstreamResp = await callUpstreamWithFallback();
+        }
 
         if (streamCancelled) { clearHB(); return; }
-        if (log) console.log(`[heartbeat] upstream connected after ${Date.now() - startedAt}ms, sent ${hbCount} HBs so far`);
+        const msSinceStart = Date.now() - startedAt;
+        if (log) console.log(`[heartbeat] upstream connected after ${msSinceStart}ms, sent ${hbCount} HBs so far`);
 
         if (!upstreamResp.ok || !upstreamResp.body) {
           clearHB();
@@ -807,8 +828,29 @@ app.post("/v1/chat/completions", async (c) => {
         const decoder = new TextDecoder();
         let buffer = "";
 
+        // Watchdog: if upstream is connected but producing nothing but
+        // reasoning/comments for too long, bail and fall back to Sonnet.
+        // Only arm on the initial (non-forced) call to avoid loops.
+        let firstContentTimer: ReturnType<typeof setTimeout> | null = null;
+        const sonnetTier = "code" as const;
+        const sonnetEntry = MODELS[sonnetTier];
+        const canFallbackToSonnet = !forceModel && actualModel !== sonnetEntry.model;
+        if (canFallbackToSonnet) {
+          firstContentTimer = setTimeout(() => {
+            if (lastContentMs || streamCancelled) return;
+            const waited = Date.now() - startedAt;
+            console.warn(
+              `[timeout] ${actualModel} no real content after ${waited}ms — ` +
+              `aborting & retrying with ${sonnetEntry.model}`,
+            );
+            reader.cancel().catch(() => {});
+            // Retry the whole pipe with Sonnet; heartbeats stay active.
+            pipeUpstream({ model: sonnetEntry.model, tier: sonnetTier });
+          }, FIRST_CONTENT_TIMEOUT_MS);
+        }
+
         for (;;) {
-          if (streamCancelled) { reader.cancel(); clearHB(); return; }
+          if (streamCancelled) { reader.cancel(); clearHB(); if (firstContentTimer) clearTimeout(firstContentTimer); return; }
           const { value, done } = await reader.read();
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
@@ -822,12 +864,16 @@ app.post("/v1/chat/completions", async (c) => {
             );
               if (rewritten.includes('"content":"') &&
                   !rewritten.includes('"content":""')) {
-                if (!lastContentMs && log) console.log(`[heartbeat] first real content at ${Date.now() - startedAt}ms after ${hbCount} HBs`);
+                if (!lastContentMs) {
+                  if (firstContentTimer) { clearTimeout(firstContentTimer); firstContentTimer = null; }
+                  if (log) console.log(`[heartbeat] first real content at ${Date.now() - startedAt}ms after ${hbCount} HBs`);
+                }
                 lastContentMs = Date.now();
               }
             ctrl.enqueue(encoder.encode(rewritten + "\n\n"));
           }
         }
+        if (firstContentTimer) { clearTimeout(firstContentTimer); firstContentTimer = null; }
         clearHB();
         if (buffer.length > 0) {
           ctrl.enqueue(encoder.encode(
@@ -837,8 +883,16 @@ app.post("/v1/chat/completions", async (c) => {
         finalizeCost(actualProvider.name, actualModel, usage);
         recordOnce(200, null);
       } catch (err) {
-        clearHB();
         if (streamCancelled) return;
+        // reader.cancel() from the timeout fires as an AbortError — that's
+        // expected; the fallback retry handles continuation.
+        const msg = String(err);
+        if (msg.includes("This readable stream reader has been released") ||
+            msg.includes("AbortError") ||
+            msg.includes("The operation was aborted")) {
+          return; // normal timeout-triggered cancellation
+        }
+        clearHB();
         console.error("[stream] error:", err);
         try { ctrl.error(err); } catch { /* already closed */ }
         return;
