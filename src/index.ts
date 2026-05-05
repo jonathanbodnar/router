@@ -740,7 +740,7 @@ app.post("/v1/chat/completions", async (c) => {
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         const encoder = new TextEncoder();
-        let seenRealContent = false;
+        let lastContentMs = 0;
         let recorded = false;
         const recordOnce = (status: number, err: string | null) => {
           if (recorded) return;
@@ -749,7 +749,7 @@ app.post("/v1/chat/completions", async (c) => {
         };
 
         const emitHeartbeat = () => {
-          if (seenRealContent) { clearHB(); return; }
+          if (lastContentMs && Date.now() - lastContentMs < HEARTBEAT_MS) return;
           const hb = JSON.stringify({
             id: `hb-${Date.now()}`,
             object: "chat.completion.chunk",
@@ -767,6 +767,8 @@ app.post("/v1/chat/completions", async (c) => {
 
         // Fire first heartbeat IMMEDIATELY so Cursor sees content
         // before its ~3s timeout, then repeat every 1.5s.
+        // Heartbeats continue for the ENTIRE stream, but skip
+        // when real content flowed recently (within HEARTBEAT_MS).
         emitHeartbeat();
         heartbeatTimer = setInterval(emitHeartbeat, HEARTBEAT_MS);
 
@@ -814,10 +816,9 @@ app.post("/v1/chat/completions", async (c) => {
               const rewritten = rewriteSseEvent(
                 rawEvent, requestedModel, usage, captured,
               );
-              if (!seenRealContent && rewritten.includes('"content":"') &&
+              if (rewritten.includes('"content":"') &&
                   !rewritten.includes('"content":""')) {
-                seenRealContent = true;
-                clearHB();
+                lastContentMs = Date.now();
               }
               controller.enqueue(encoder.encode(rewritten + "\n\n"));
             }
