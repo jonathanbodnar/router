@@ -724,11 +724,11 @@ app.post("/v1/chat/completions", async (c) => {
     "x-accel-buffering": "no",
   });
 
-  // Heartbeat for thinking models (MiMo): Cursor sees "gpt-4.1" and
-  // expects content within ~3s. MiMo's upstream fetch alone takes ~4s
-  // before the first byte. We must return the response stream to
-  // Cursor BEFORE the fetch so heartbeats flow immediately.
-  const needsHeartbeat = HEARTBEAT_MODELS.has(actualModel) && isStream;
+  // Cursor sees "gpt-4.1" and times out if it doesn't get content within ~3s.
+  // This affects ALL models — not just MiMo — when context is large (Sonnet
+  // with 300K+ tokens also takes 10-30s before first token). Apply heartbeats
+  // to every streaming request so the connection never stalls.
+  const needsHeartbeat = isStream;
   const HEARTBEAT_MS = 1_500;
 
   if (needsHeartbeat) {
