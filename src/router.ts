@@ -252,6 +252,35 @@ const REASONING_RE = new RegExp(
     // hard / stakes language
     "hard problem",
     "very hard\\b",
+    // complex project language
+    "big project",
+    "large project",
+    "complex project",
+    "significant project",
+    "major project",
+    "(?:lots?|multiple|many) (?:of )?complex",
+    "complex (?:pieces|parts|components|systems|features)",
+    "multi[- ]?(?:tenant|service|system)",
+    "full[- ]?stack",
+    "greenfield",
+    "from scratch",
+  ].join("|"),
+  "i",
+);
+
+/**
+ * Explicit user requests for stronger reasoning. These bypass the token
+ * minimum entirely — if the user literally asks for "maximum reasoning"
+ * or "use opus" in prose, honour it regardless of message length.
+ */
+const EXPLICIT_REASONING_REQUEST_RE = new RegExp(
+  [
+    "(?:use|want|need|please|with) (?:max(?:imum)?|high|deep|full|strong|best|heavy) reasoning",
+    "(?:max(?:imum)?|highest|strongest|deepest|best) (?:reasoning|thinking|effort)",
+    "(?:use|give me|switch to|send to|route to) (?:opus|the best model|best model|reasoning model)",
+    "this (?:is|needs|requires|deserves) (?:a )?(?:big|large|complex|hard|difficult|significant|serious|major)",
+    "(?:needs?|requires?|deserves?) (?:deep|careful|thorough|maximum|best) (?:thought|thinking|reasoning|analysis|attention)",
+    "(?:deep|careful|thorough) reasoning",
   ].join("|"),
   "i",
 );
@@ -268,10 +297,10 @@ const REASONING_RE = new RegExp(
  *     long context wins.
  */
 const LONG_CONTEXT_TOKENS = 32_000; // total-context bulk threshold (MiMo)
-const REASONING_USER_MIN_TOKENS = 600; // user's ask must be substantive to
-//                                     // warrant Opus, otherwise a 5-token
-//                                     // mention of "architecture" routes us
-//                                     // to a $0.30 reply.
+const REASONING_USER_MIN_TOKENS = 150; // user's ask must be more than a
+//                                     // one-liner to warrant Opus via
+//                                     // implicit signals. Explicit requests
+//                                     // ("max reasoning") bypass this.
 const MODERATE_CODE_USER_TOKENS = 1_500; // pasted-code threshold for Sonnet
 const CONVERSATIONAL_MAX_TOKENS = 60; // short msgs with conversational
 //                                    // signals go to cheap even with tools;
@@ -303,17 +332,28 @@ function classify(req: IncomingRequest): RouteDecision {
   const hasDevVerb = DEV_TASK_RE.test(userText);
   const hasCodeyTokens = CODEY_TOKENS_RE.test(userText);
   const looksReasoning = REASONING_RE.test(userText);
+  const explicitReasoningReq = EXPLICIT_REASONING_REQUEST_RE.test(userText);
 
   const strongCodeSignal = hasCodeFence || hasFilePath || hasDevVerb;
   const weakCodeSignal = hasCodeyTokens;
   const codeSignal = strongCodeSignal || weakCodeSignal;
 
-  // 1. Highest-stakes reasoning / architecture -> Opus.
-  //    Require BOTH a reasoning regex hit in the user's latest message
-  //    AND that user message to be substantive. This is intentionally
-  //    strict; pair it with the LLM classifier (cheap upgrade pass) and
-  //    explicit `!hard` / `[opus]` overrides for the cases where the user
-  //    asks something genuinely hard in a short prompt.
+  // 1a. Explicit user request for reasoning / best model -> Opus.
+  //     No token minimum — if the user literally asks for "maximum
+  //     reasoning" or says "this is a big project", honour it.
+  if (explicitReasoningReq) {
+    return decide(
+      "reasoning",
+      `explicit reasoning request in user msg (~${userTokens} user tok / ${totalTokens} total)`,
+    );
+  }
+
+  // 1b. Highest-stakes reasoning / architecture -> Opus.
+  //     Require BOTH a reasoning regex hit in the user's latest message
+  //     AND that user message to be substantive. This is intentionally
+  //     strict; pair it with the LLM classifier (cheap upgrade pass) and
+  //     explicit `!hard` / `[opus]` overrides for the cases where the user
+  //     asks something genuinely hard in a short prompt.
   if (looksReasoning && userTokens >= REASONING_USER_MIN_TOKENS) {
     return decide(
       "reasoning",

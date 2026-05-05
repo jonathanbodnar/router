@@ -91,6 +91,24 @@ const cases: Case[] = [
       tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
       messages: [{ role: "user", content: "thanks, can you also check why it's slow?" }] } },
 
+  // --- explicit reasoning requests (bypass token minimum) ---
+  { name: "big project + max reasoning", expect: "reasoning",
+    req: { model: "gpt-4.1__RevOs",
+      tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
+      messages: [{ role: "user", content:
+        "this is a big project, with lots of complex pieces please use maximum reasoning: I need a basic clean interface, where super admin can create a Clinic account" }] } },
+  { name: "use best model = reasoning", expect: "reasoning",
+    req: { model: "gpt-4.1",
+      tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
+      messages: [{ role: "user", content: "use the best model for this, redesign the auth flow" }] } },
+  { name: "needs deep thinking = reasoning", expect: "reasoning",
+    req: { model: "auto",
+      messages: [{ role: "user", content: "this needs deep careful reasoning — plan the entire multi-tenant schema" }] } },
+  { name: "this is complex = reasoning", expect: "reasoning",
+    req: { model: "gpt-4.1",
+      tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
+      messages: [{ role: "user", content: "this is a large complex project from scratch, build the full payment system" }] } },
+
   // --- aliases / passthrough ---
   { name: "alias: easy",   expect: "agentic",  req: { model: "easy",   messages: [{ role: "user", content: "hi" }] } },
   { name: "alias: code",   expect: "code",     req: { model: "code",   messages: [{ role: "user", content: "hi" }] } },
