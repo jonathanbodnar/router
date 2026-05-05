@@ -109,6 +109,26 @@ const cases: Case[] = [
       tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
       messages: [{ role: "user", content: "this is a large complex project from scratch, build the full payment system" }] } },
 
+  // --- $93 regression: Opus with huge growing context -> downgrade to Sonnet ---
+  // Once the agent loop is deep (100K+ tokens), we're doing implementation
+  // work. Downgrade from Opus to Sonnet even if the original message asked
+  // for "maximum reasoning". The first planning turn is cheap; turns 10-40
+  // doing file reads/writes should be Sonnet.
+  { name: "regression: max reasoning but huge context = Sonnet", expect: "code",
+    req: { model: "gpt-4.1__RevOs",
+      tools: Array.from({ length: 19 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, parameters: {} } })),
+      messages: [
+        { role: "user", content:
+          "this is a big project, with lots of complex pieces please use maximum reasoning" },
+        // Simulate 40 turns of growing agent context (tool calls, file reads, etc.)
+        { role: "assistant", content: "I'll build this step by step. " + "lorem ipsum ".repeat(6000) },
+        { role: "tool", content: "file contents: " + "code ".repeat(6000), tool_call_id: "t1" },
+        { role: "assistant", content: "continuing... " + "lorem ipsum ".repeat(6000) },
+        { role: "tool", content: "more output: " + "code ".repeat(6000), tool_call_id: "t2" },
+        { role: "assistant", content: "nearly done. " + "lorem ipsum ".repeat(3000) },
+        { role: "user", content: "this is a big project, with lots of complex pieces please use maximum reasoning" },
+      ] } },
+
   // --- aliases / passthrough ---
   { name: "alias: easy",   expect: "agentic",  req: { model: "easy",   messages: [{ role: "user", content: "hi" }] } },
   { name: "alias: code",   expect: "code",     req: { model: "code",   messages: [{ role: "user", content: "hi" }] } },

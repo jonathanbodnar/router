@@ -296,15 +296,23 @@ const EXPLICIT_REASONING_REQUEST_RE = new RegExp(
  *     (`totalTokens`), because that's what determines whether MiMo's
  *     long context wins.
  */
-const LONG_CONTEXT_TOKENS = 32_000; // total-context bulk threshold (MiMo)
+const LONG_CONTEXT_TOKENS = 32_000;   // total-context bulk threshold (MiMo)
 const REASONING_USER_MIN_TOKENS = 150; // user's ask must be more than a
 //                                     // one-liner to warrant Opus via
 //                                     // implicit signals. Explicit requests
 //                                     // ("max reasoning") bypass this.
 const MODERATE_CODE_USER_TOKENS = 1_500; // pasted-code threshold for Sonnet
-const CONVERSATIONAL_MAX_TOKENS = 60; // short msgs with conversational
-//                                    // signals go to cheap even with tools;
-//                                    // Cursor always sends 19 tools.
+const CONVERSATIONAL_MAX_TOKENS = 60;  // short msgs with conversational
+//                                     // signals go to cheap even with tools;
+//                                     // Cursor always sends 19 tools.
+
+// Above this total-context size, downgrade Opus -> Sonnet even for explicit
+// reasoning requests. The initial planning turn has a small context; once
+// Cursor's agent loop kicks in (tool results, generated code, growing history)
+// the context balloons to 100K–500K tokens. At that point we're doing
+// implementation work where Sonnet is equally capable and 5x cheaper.
+// Users who genuinely need Opus on a massive context can use !hard / [opus].
+const OPUS_MAX_CONTEXT_TOKENS = 60_000;
 
 /* ---------- main classifier ---------- */
 
@@ -341,7 +349,19 @@ function classify(req: IncomingRequest): RouteDecision {
   // 1a. Explicit user request for reasoning / best model -> Opus.
   //     No token minimum — if the user literally asks for "maximum
   //     reasoning" or says "this is a big project", honour it.
+  //
+  //     CONTEXT-SIZE GUARD: if the total context is already large, we're
+  //     deep in an agent loop (tool results + generated code ballooning the
+  //     history). The initial planning reasoning has already happened; the
+  //     remaining turns are implementation. Downgrade to Sonnet — same
+  //     quality for code work at 5× lower cost. Override with !hard / [opus].
   if (explicitReasoningReq) {
+    if (totalTokens > OPUS_MAX_CONTEXT_TOKENS) {
+      return decide(
+        "code",
+        `explicit reasoning request but context too large for Opus (${totalTokens} tok > ${OPUS_MAX_CONTEXT_TOKENS} cap) -> Sonnet`,
+      );
+    }
     return decide(
       "reasoning",
       `explicit reasoning request in user msg (~${userTokens} user tok / ${totalTokens} total)`,
@@ -355,6 +375,12 @@ function classify(req: IncomingRequest): RouteDecision {
   //     explicit `!hard` / `[opus]` overrides for the cases where the user
   //     asks something genuinely hard in a short prompt.
   if (looksReasoning && userTokens >= REASONING_USER_MIN_TOKENS) {
+    if (totalTokens > OPUS_MAX_CONTEXT_TOKENS) {
+      return decide(
+        "code",
+        `reasoning signal but context too large for Opus (${totalTokens} tok > ${OPUS_MAX_CONTEXT_TOKENS} cap) -> Sonnet`,
+      );
+    }
     return decide(
       "reasoning",
       `reasoning signal in user msg (~${userTokens} user tok / ${totalTokens} total)`,
