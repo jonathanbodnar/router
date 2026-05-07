@@ -1,17 +1,30 @@
 /**
  * Upstream LLM providers we know how to talk to.
  *
- * Both Fireworks and OpenRouter expose an OpenAI-compatible
- * `/chat/completions` endpoint, so the only differences we care about are:
+ * All three expose an OpenAI-compatible `/chat/completions` endpoint, so
+ * the only differences we care about are:
  *
  *   - the base URL,
  *   - the API key env var,
  *   - whether to inject `usage: {include: true}` (OpenRouter extension),
- *   - whether the response includes `usage.cost` (OpenRouter does, Fireworks
- *     doesn't — we compute cost from tokens via pricing.ts for those).
+ *   - whether the response includes `usage.cost` (OpenRouter does;
+ *     Fireworks and Anthropic OpenAI-compat don't — we compute cost from
+ *     tokens via pricing.ts for those).
+ *
+ * Direct Anthropic mode (ROUTER_USE_DIRECT_ANTHROPIC=1) routes the
+ * `code` and `reasoning` tiers through Anthropic's OpenAI-compatible
+ * endpoint instead of OpenRouter. Tradeoffs:
+ *
+ *   PRO:  one fewer proxy hop -> faster first-token latency
+ *   CON:  Anthropic's compat endpoint does NOT support prompt caching
+ *         (per docs), so for repeat-prefix workloads (Cursor agent loops)
+ *         OpenRouter + cache_control markers is actually cheaper.
+ *
+ * Recommendation: keep OpenRouter mode (default) unless you specifically
+ * want lowest first-token latency on one-shot calls.
  */
 
-export type Provider = "openrouter" | "fireworks";
+export type Provider = "openrouter" | "fireworks" | "anthropic";
 
 export interface ProviderConfig {
   name: Provider;
@@ -49,6 +62,15 @@ export function loadProviders(): Record<Provider, ProviderConfig> {
       costFromUsage: false,
       extraHeaders: {},
     },
+    anthropic: {
+      name: "anthropic",
+      baseUrl:
+        process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com/v1",
+      apiKey: process.env.ANTHROPIC_API_KEY ?? "",
+      injectUsageInclude: false,
+      costFromUsage: false,
+      extraHeaders: {},
+    },
   };
 }
 
@@ -60,5 +82,16 @@ export function detectProvider(modelId: string): Provider {
   ) {
     return "fireworks";
   }
+  if (modelId.startsWith("claude-")) {
+    return "anthropic";
+  }
   return "openrouter";
+}
+
+/** True when the user has opted into direct-Anthropic for code/reasoning. */
+export function useDirectAnthropic(): boolean {
+  return (
+    process.env.ROUTER_USE_DIRECT_ANTHROPIC === "1" &&
+    !!process.env.ANTHROPIC_API_KEY
+  );
 }

@@ -86,36 +86,119 @@ export function nestFlatTools(
 }
 
 /**
- * Flatten a Responses-API content array (`[{type:"input_text", text}, ...]`)
- * into a single newline-joined string. Unknown part types and bare strings
- * pass through; everything else is dropped.
+ * Translate a Responses-API content array into chat-completions content.
+ *
+ * Returns either a plain string (when the array contains only text parts —
+ * the common case for Cursor's regular chat messages) OR a structured
+ * `[{type, ...}]` array preserving image parts so vision-capable models
+ * (Claude 3+/4+, GPT-4o, etc.) can actually see what the user attached.
+ *
+ * Recognised image shapes:
+ *   - OpenAI Chat Completions: { type: "image_url", image_url: {url, detail?} }
+ *   - Responses-API:           { type: "input_image", image_url: "..." | {url} }
+ *   - Anthropic Messages API:  { type: "image", source: { type: "base64",
+ *                                                          media_type, data } }
+ *
+ * All shapes are normalised to the OpenAI Chat Completions form
+ * (`{type:"image_url", image_url:{url}}`). OpenRouter's Anthropic adapter
+ * accepts that shape and translates further if needed.
  */
-function partsToText(parts: unknown): string {
+type ContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string; detail?: string } };
+
+function partsToContent(parts: unknown): string | ContentPart[] {
   if (typeof parts === "string") return parts;
   if (!Array.isArray(parts)) return "";
-  const pieces: string[] = [];
+  const out: ContentPart[] = [];
+  let hasImage = false;
   for (const p of parts) {
     if (typeof p === "string") {
-      if (p) pieces.push(p);
+      if (p) out.push({ type: "text", text: p });
       continue;
     }
     if (!p || typeof p !== "object") continue;
     const part = p as Record<string, unknown>;
+
     if (typeof part.text === "string" && part.text) {
-      pieces.push(part.text);
-    } else if (typeof part.content === "string" && part.content) {
-      pieces.push(part.content);
+      out.push({ type: "text", text: part.text });
+      continue;
     }
-    // image_url / file etc. silently skipped — chat completions can carry
-    // them but most upstreams choke on the Responses-API field names, and
-    // for now we only need text for routing decisions to work.
+    if (typeof part.content === "string" && part.content && part.type !== "image") {
+      out.push({ type: "text", text: part.content });
+      continue;
+    }
+
+    // Image parts — three input shapes, all collapsed to `image_url`.
+    if (part.type === "image_url" || part.type === "input_image") {
+      const iu = part.image_url;
+      let url: string | undefined;
+      let detail: string | undefined;
+      if (typeof iu === "string") {
+        url = iu;
+      } else if (iu && typeof iu === "object") {
+        const o = iu as Record<string, unknown>;
+        if (typeof o.url === "string") url = o.url;
+        if (typeof o.detail === "string") detail = o.detail;
+      }
+      if (url) {
+        const block: ContentPart = { type: "image_url", image_url: { url } };
+        if (detail) block.image_url.detail = detail;
+        out.push(block);
+        hasImage = true;
+      }
+      continue;
+    }
+    if (
+      part.type === "image" &&
+      part.source &&
+      typeof part.source === "object"
+    ) {
+      const s = part.source as Record<string, unknown>;
+      if (
+        s.type === "base64" &&
+        typeof s.media_type === "string" &&
+        typeof s.data === "string"
+      ) {
+        out.push({
+          type: "image_url",
+          image_url: { url: `data:${s.media_type};base64,${s.data}` },
+        });
+        hasImage = true;
+      } else if (s.type === "url" && typeof s.url === "string") {
+        out.push({ type: "image_url", image_url: { url: s.url } });
+        hasImage = true;
+      }
+    }
   }
-  return pieces.join("\n");
+  if (!hasImage) {
+    // Backwards-compatible: text-only content collapses to a string so
+    // downstream classifier code (and old callers) keeps working.
+    return out
+      .filter((p): p is { type: "text"; text: string } => p.type === "text")
+      .map((p) => p.text)
+      .join("\n");
+  }
+  return out;
+}
+
+/**
+ * Text-only flatten of a content array. Used by routing/classifier code
+ * that only cares about prose. Images are dropped here intentionally —
+ * the heuristic doesn't classify by visual content.
+ */
+function partsToText(parts: unknown): string {
+  const c = partsToContent(parts);
+  if (typeof c === "string") return c;
+  return c
+    .filter((p): p is { type: "text"; text: string } => p.type === "text")
+    .map((p) => p.text)
+    .join("\n");
 }
 
 interface ChatMessage {
   role: string;
-  content: string | null;
+  content: string | ContentPart[] | null;
   tool_calls?: Array<{
     id: string;
     type: "function";
@@ -181,13 +264,13 @@ export function inputArrayToMessages(input: unknown[]): ChatMessage[] {
     }
 
     // Plain message: {role, content?} where content may be a string or
-    // an array of typed parts.
+    // an array of typed parts. We use partsToContent so images survive.
     if (typeof it.role === "string") {
-      let content: string;
+      let content: string | ContentPart[];
       if (typeof it.content === "string") {
         content = it.content;
       } else if (Array.isArray(it.content)) {
-        content = partsToText(it.content);
+        content = partsToContent(it.content);
       } else if (typeof it.text === "string") {
         content = it.text;
       } else {
@@ -239,6 +322,13 @@ function stripResponsesApiFields(
     "truncation",
     "include",
     "background",
+    // `metadata` is a Cursor-injected tracking blob (`{project: "..."}`).
+    // Some strict OpenRouter-mediated providers return success but never
+    // produce content when this is present — likely cause of the
+    // `gpt-4.1__shoutout` stall. We already detect project via the
+    // workspace-path heuristic + X-Router-Project header, so the upstream
+    // doesn't need it.
+    "metadata",
   ] as const) {
     if (k in next) {
       const { [k]: _drop, ...rest } = next;

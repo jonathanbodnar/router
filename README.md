@@ -64,6 +64,65 @@ at 25% sampling, ~$0.05/day. The judge's cost is added to that call's
 Off by default. Turn it on with `ROUTER_JUDGE=1`. See `.env.example`
 for sampling / threshold / model overrides.
 
+### Anthropic prompt caching (the big cost lever)
+
+Sonnet and Opus calls can route through OpenRouter with **`cache_control: ephemeral`**
+breakpoints injected automatically (`src/prompt-cache.ts`). Anthropic
+charges cache writes at 1.25x normal input price and cache reads at
+**0.1x** input price, so for Cursor's repetitive agent loop (same 18k
+system prompt + 19 tool defs + growing history sent on every turn)
+total input cost typically drops by **~80-90%**. This is why a Cursor
+BYOK Anthropic key feels cheaper than a naive proxy.
+
+Markers we inject (Anthropic allows up to 4 breakpoints):
+- the **last tool definition** (caches the entire tools array)
+- the **last system / developer message** (caches the system prompt)
+- the **most recent assistant or tool message** before the latest user
+  turn (caches the conversation history; the new user turn stays fresh
+  so the cache hits across turns).
+
+Disable with `ROUTER_PROMPT_CACHE=0`. Idempotent — pre-existing
+`cache_control` markers from the client are respected.
+
+### Direct Anthropic mode (optional)
+
+If you want to skip the OpenRouter hop entirely for Sonnet/Opus, set
+`ROUTER_USE_DIRECT_ANTHROPIC=1` and provide `ANTHROPIC_API_KEY`. Calls
+hit Anthropic's OpenAI-compatible endpoint at `https://api.anthropic.com/v1/`
+with shorter latency. **Trade-off:** Anthropic's compat endpoint does
+not support prompt caching, so for repeat-prefix workloads (the typical
+Cursor agent loop) OpenRouter + caching is actually cheaper. Use direct
+mode when first-token latency matters more than cost.
+
+Override the model ids per tier:
+- `ROUTER_MODEL_CODE` (default: `anthropic/claude-sonnet-4.6` on
+  OpenRouter, `claude-sonnet-4-6` on direct)
+- `ROUTER_MODEL_REASONING` (default: `anthropic/claude-opus-4.7` on
+  OpenRouter, `claude-opus-4-7` on direct)
+
+### Vision / image support
+
+Image content (`image_url` parts in OpenAI shape, `input_image` in
+Cursor's Responses-API shape, or Anthropic-style `image` source blocks)
+is preserved end-to-end and forwarded to vision-capable models like
+Claude 4.x and GPT-4o. Text-only requests still flatten content to a
+plain string for backwards compatibility with the routing heuristics.
+
+### Stream timeout safety net
+
+Streaming requests are protected by two layers of timeout:
+
+1. **First-content timeout** (18s, was 18s — unchanged): if the upstream
+   connects but produces no real content within the window, the router
+   walks a stall-fallback chain — Sonnet first, then DeepSeek as a final
+   resort on a separate provider — so a wedged provider can never block
+   indefinitely.
+2. **Hard stream ceiling** (`ROUTER_MAX_STREAM_MS`, default 180s): even
+   if heartbeats keep the connection alive, the stream is closed cleanly
+   with `finish_reason: "stop"` after this duration. Prevents the
+   "request never responds" symptom seen on workspaces with very large
+   contexts.
+
 ### Reasoning-model controls
 
 Reasoning-heavy models like Xiaomi MiMo V2.5 Pro and Anthropic's
@@ -124,7 +183,11 @@ The `/dashboard` UI is HTTP-Basic protected (username `admin`, password
     id format: `accounts/fireworks/...` &rarr; Fireworks; everything else
     (e.g. `anthropic/claude-opus-4.7`) &rarr; OpenRouter.
 - `GET  /dashboard` &mdash; HTML dashboard (totals, breakdowns, recent calls).
-- `GET  /dashboard/api/stats?period=24h|7d|30d|all` &mdash; the same data as JSON.
+- `GET  /dashboard/api/stats?period=24h|7d|30d|all` &mdash; same data as JSON.
+- `GET  /dashboard/api/stats?from=<epoch>&to=<epoch>` &mdash; custom date
+  range (epoch seconds). Either bound is optional; missing `from` means
+  all of history, missing `to` means now. The dashboard UI exposes a
+  date-pair picker plus a `today` preset for calendar-day filtering.
 
 The response's `model` field is rewritten back to whatever the client
 requested (e.g. `auto`), and a `_router` debug object is attached on
@@ -280,13 +343,16 @@ From here on, Cursor sends every request to your Railway service, which:
 - `src/breaker.ts` &mdash; in-process circuit breaker for flapping upstream models (skips primary, goes to fallback).
 - `src/db.ts` &mdash; SQLite schema, `recordCall`, `updateQuality`, dashboard queries.
 - `src/dashboard.ts` &mdash; HTML dashboard + JSON stats API + Basic-auth gate.
-- `src/normalise.ts` &mdash; body-shape normalisation (Responses API ↔ Chat Completions, flat tools ↔ nested).
+- `src/normalise.ts` &mdash; body-shape normalisation (Responses API ↔ Chat Completions, flat tools ↔ nested, image-content preservation).
+- `src/prompt-cache.ts` &mdash; injects Anthropic `cache_control` breakpoints for Sonnet/Opus calls so OpenRouter applies the 10x cache-read discount.
 - `scripts/test-router.ts` &mdash; offline sanity checks for the heuristic classifier.
 - `scripts/test-classifier.ts` &mdash; unit tests for prompt overrides + hybrid LLM classifier (mocked).
 - `scripts/test-judge.ts` &mdash; unit tests for the quality judge (mocked).
 - `scripts/test-breaker.ts` &mdash; unit tests for the circuit breaker.
 - `scripts/test-fallback.ts` &mdash; end-to-end test for upstream-failure fallback + prompt overrides.
-- `scripts/test-normalise.ts` &mdash; unit tests for body-shape normalisation.
+- `scripts/test-normalise.ts` &mdash; unit tests for body-shape normalisation (incl. image preservation).
+- `scripts/test-prompt-cache.ts` &mdash; unit tests for cache_control breakpoint injection.
+- `scripts/test-work-type.ts` &mdash; unit tests for the dashboard work-type tag classifier.
 - `scripts/smoke.ts` &mdash; offline DB / classifier smoke test.
 - `scripts/http-smoke.ts` &mdash; full HTTP smoke test against a fake upstream (covers both providers).
 - `railway.json` &mdash; build/start commands and healthcheck for Railway.

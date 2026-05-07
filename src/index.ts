@@ -14,6 +14,7 @@ import { DEFAULT_CONFIG as JUDGE_CFG, scheduleJudge } from "./judge.js";
 import { DEFAULT_CONFIG as CLASSIFIER_CFG, maybeUpgradeWithLLM } from "./llm-classifier.js";
 import { normaliseBody } from "./normalise.js";
 import { computeCost } from "./pricing.js";
+import { withPromptCaching } from "./prompt-cache.js";
 import { loadProviders, type Provider } from "./providers.js";
 import {
   classifyEffort,
@@ -394,6 +395,10 @@ app.post("/v1/chat/completions", async (c) => {
     let payload: IncomingRequest = { ...body, model };
     if (p.injectUsageInclude) payload = withUsageIncluded(payload);
     payload = withReasoningEffort(payload, model, reasoningEffort);
+    // Inject Anthropic prompt-cache breakpoints when targeting Sonnet/Opus.
+    // Cuts repeat-prefix input cost by ~10x via Anthropic's ephemeral cache
+    // (writes 1.25x, reads 0.1x). No-op for other models.
+    payload = withPromptCaching(payload, model);
 
     const headers: Record<string, string> = {};
     c.req.raw.headers.forEach((value, name) => {
@@ -751,9 +756,15 @@ app.post("/v1/chat/completions", async (c) => {
 
   if (needsHeartbeat) {
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    let hardTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
     let streamCancelled = false;
     const clearHB = () => {
       if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    };
+    /** Clear all outstanding stream timers (heartbeat + hard ceiling). */
+    const clearAllStreamTimers = () => {
+      clearHB();
+      if (hardTimeoutTimer) { clearTimeout(hardTimeoutTimer); hardTimeoutTimer = null; }
     };
 
     const encoder = new TextEncoder();
@@ -790,10 +801,63 @@ app.post("/v1/chat/completions", async (c) => {
     };
 
     // If the upstream model connects but produces no real content for this
-    // many ms, abort it and retry with Sonnet directly. MiMo's median
+    // many ms, abort it and retry with the next fallback. MiMo's median
     // first-content time is 10-15s; the slow tail (>18s) often runs to
     // 60-80s when OpenRouter is queue-backlogged, killing Cursor subagents.
     const FIRST_CONTENT_TIMEOUT_MS = 18_000;
+
+    // Hard ceiling on a single streaming request. After this we close the
+    // stream with a synthetic finish_reason so Cursor never sits on a
+    // perpetually heartbeating connection — was the symptom of the
+    // gpt-4.1__shoutout stall.
+    const MAX_STREAM_MS = Number(
+      process.env.ROUTER_MAX_STREAM_MS ?? 180_000,
+    );
+
+    /**
+     * Ordered fallback chain when the FIRST upstream produces no content
+     * within FIRST_CONTENT_TIMEOUT_MS. Walked top-down; each tier we
+     * haven't already tried gets one shot. Final resort is `cheap`
+     * (DeepSeek on Fireworks), which is on a separate provider and
+     * almost never queues, so even a complete OpenRouter outage can't
+     * leave the user on a dead heartbeat.
+     */
+    const stallFallbackChain: Array<{ tier: typeof decision.tier }> = [
+      { tier: "code" },     // Sonnet
+      { tier: "cheap" },    // DeepSeek
+    ];
+
+    /** Track which models we've already tried so we don't loop. */
+    const stallTried = new Set<string>([decision.model]);
+
+    const armHardTimeout = () => {
+      if (hardTimeoutTimer) return;
+      hardTimeoutTimer = setTimeout(() => {
+        if (streamCancelled) return;
+        console.error(
+          `[max-stream-timeout] hit ${MAX_STREAM_MS}ms ceiling for ${actualModel} — closing stream`,
+        );
+        // Emit a clean finish so Cursor doesn't hang on the connection.
+        const finalChunk = JSON.stringify({
+          id: `timeout-${Date.now()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: requestedModel,
+          choices: [{
+            index: 0,
+            delta: { content: "\n[router: upstream exceeded max stream duration]" },
+            finish_reason: "stop",
+          }],
+        });
+        try {
+          ctrl.enqueue(encoder.encode(`data: ${finalChunk}\n\ndata: [DONE]\n\n`));
+        } catch { /* already closed */ }
+        recordOnce(504, `max stream duration ${MAX_STREAM_MS}ms exceeded`);
+        clearAllStreamTimers();
+        streamCancelled = true;
+        try { ctrl.close(); } catch { /* already closed */ }
+      }, MAX_STREAM_MS);
+    };
 
     // Detached async function that fetches upstream and pipes
     // chunks into the controller. Runs independently of start().
@@ -815,12 +879,12 @@ app.post("/v1/chat/completions", async (c) => {
           upstreamResp = await callUpstreamWithFallback();
         }
 
-        if (streamCancelled) { clearHB(); return; }
+        if (streamCancelled) { clearAllStreamTimers(); return; }
         const msSinceStart = Date.now() - startedAt;
         if (log) console.log(`[heartbeat] upstream connected after ${msSinceStart}ms, sent ${hbCount} HBs so far`);
 
         if (!upstreamResp.ok || !upstreamResp.body) {
-          clearHB();
+          clearAllStreamTimers();
           const text = await upstreamResp.text();
           console.error(
             `[upstream:${actualProvider.name}] ${upstreamResp.status} (hb-stream) body=${text.slice(0, 800)}`,
@@ -847,28 +911,50 @@ app.post("/v1/chat/completions", async (c) => {
         let buffer = "";
 
         // Watchdog: if upstream is connected but producing nothing but
-        // reasoning/comments for too long, bail and fall back to Sonnet.
-        // Only arm on the initial (non-forced) call to avoid loops.
+        // reasoning/comments for too long, bail and walk the stall fallback
+        // chain (Sonnet -> DeepSeek). Each call gets exactly one timer; on
+        // each retry we pick the next un-tried tier. This eliminates the
+        // "Sonnet retry also stalls -> heartbeats forever" failure mode
+        // that plagued the gpt-4.1__shoutout workspace.
         let firstContentTimer: ReturnType<typeof setTimeout> | null = null;
-        const sonnetTier = "code" as const;
-        const sonnetEntry = MODELS[sonnetTier];
-        const canFallbackToSonnet = !forceModel && actualModel !== sonnetEntry.model;
-        if (canFallbackToSonnet) {
+        const nextStallFallback = ():
+          | { model: string; tier: typeof decision.tier }
+          | null => {
+          for (const step of stallFallbackChain) {
+            const entry = MODELS[step.tier];
+            if (!stallTried.has(entry.model)) {
+              return { model: entry.model, tier: step.tier };
+            }
+          }
+          return null;
+        };
+        const stallTarget = nextStallFallback();
+        if (stallTarget) {
           firstContentTimer = setTimeout(() => {
             if (lastContentMs || streamCancelled) return;
             const waited = Date.now() - startedAt;
             console.warn(
               `[timeout] ${actualModel} no real content after ${waited}ms — ` +
-              `aborting & retrying with ${sonnetEntry.model}`,
+                `aborting & retrying with ${stallTarget.model} (${stallTarget.tier})`,
             );
             reader.cancel().catch(() => {});
-            // Retry the whole pipe with Sonnet; heartbeats stay active.
-            pipeUpstream({ model: sonnetEntry.model, tier: sonnetTier });
+            stallTried.add(stallTarget.model);
+            // Retry the whole pipe with the next fallback; heartbeats and
+            // the hard-ceiling timer stay active across retries.
+            pipeUpstream(stallTarget);
           }, FIRST_CONTENT_TIMEOUT_MS);
         }
 
+        // Arm the hard ceiling on the FIRST pipe call (re-arm is a no-op).
+        armHardTimeout();
+
         for (;;) {
-          if (streamCancelled) { reader.cancel(); clearHB(); if (firstContentTimer) clearTimeout(firstContentTimer); return; }
+          if (streamCancelled) {
+            reader.cancel();
+            if (firstContentTimer) clearTimeout(firstContentTimer);
+            clearAllStreamTimers();
+            return;
+          }
           const { value, done } = await reader.read();
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
@@ -892,7 +978,7 @@ app.post("/v1/chat/completions", async (c) => {
           }
         }
         if (firstContentTimer) { clearTimeout(firstContentTimer); firstContentTimer = null; }
-        clearHB();
+        clearAllStreamTimers();
         if (buffer.length > 0) {
           ctrl.enqueue(encoder.encode(
             rewriteSseEvent(buffer, requestedModel, usage, captured),
@@ -910,7 +996,7 @@ app.post("/v1/chat/completions", async (c) => {
             msg.includes("The operation was aborted")) {
           return; // normal timeout-triggered cancellation
         }
-        clearHB();
+        clearAllStreamTimers();
         console.error("[stream] error:", err);
         try { ctrl.error(err); } catch { /* already closed */ }
         return;
@@ -932,7 +1018,7 @@ app.post("/v1/chat/completions", async (c) => {
       },
       cancel(reason) {
         streamCancelled = true;
-        clearHB();
+        clearAllStreamTimers();
         console.log(`[heartbeat] stream CANCELLED after ${hbCount} HBs, reason:`, reason);
       },
     });

@@ -101,11 +101,22 @@ expect("client gets 200", r1.status === 200, `status=${r1.status}`);
 expect("served by sonnet", r1.body?._router?.routed_to === "anthropic/claude-sonnet-4.6", `routed_to=${r1.body?._router?.routed_to}`);
 expect("fell_back recorded", r1.body?._router?.fell_back?.includes("claude-sonnet-4.6") === true, `fell_back=${r1.body?._router?.fell_back}`);
 
-console.log("\n=== test 2: mimo -> falls back to sonnet ===");
+console.log("\n=== test 2: mimo -> falls back to deepseek (cost-aware) ===");
+// The agentic -> cheap fallback is intentional (see router.ts comments):
+// MiMo failure shouldn't burn Sonnet money. DeepSeek on a separate
+// provider gives us a healthy response and avoids the BYOK rate limit.
 const r2 = await call("easy"); // alias for MiMo
 expect("client gets 200", r2.status === 200, `status=${r2.status}`);
-expect("served by sonnet", r2.body?._router?.routed_to === "anthropic/claude-sonnet-4.6", `routed_to=${r2.body?._router?.routed_to}`);
-expect("fell_back recorded", r2.body?._router?.fell_back?.includes("claude-sonnet-4.6") === true, `fell_back=${r2.body?._router?.fell_back}`);
+expect(
+  "served by deepseek",
+  r2.body?._router?.routed_to?.includes("deepseek-v4-pro") === true,
+  `routed_to=${r2.body?._router?.routed_to}`,
+);
+expect(
+  "fell_back recorded as deepseek",
+  r2.body?._router?.fell_back?.includes("deepseek-v4-pro") === true,
+  `fell_back=${r2.body?._router?.fell_back}`,
+);
 
 console.log("\n=== test 3: cheap -> succeeds without fallback ===");
 const r3 = await call("cheap");

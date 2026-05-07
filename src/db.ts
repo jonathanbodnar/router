@@ -133,18 +133,38 @@ export function updateQuality(u: QualityUpdate): void {
 
 export type Period = "24h" | "7d" | "30d" | "all";
 
-function sinceFor(period: Period): number {
+/**
+ * Time range for any analytics query. A `Period` preset, or an explicit
+ * `{from, to}` (epoch seconds) for the dashboard's custom date picker.
+ * `to` defaults to now; `from` defaults to 0 (all time).
+ */
+export type Range =
+  | Period
+  | { from?: number; to?: number };
+
+interface ResolvedRange {
+  since: number; // inclusive (epoch seconds)
+  until: number; // inclusive (epoch seconds; defaults to now)
+}
+
+function resolveRange(range: Range): ResolvedRange {
   const now = Math.floor(Date.now() / 1000);
-  switch (period) {
-    case "24h":
-      return now - 24 * 3600;
-    case "7d":
-      return now - 7 * 24 * 3600;
-    case "30d":
-      return now - 30 * 24 * 3600;
-    case "all":
-      return 0;
+  if (typeof range === "string") {
+    switch (range) {
+      case "24h":
+        return { since: now - 24 * 3600, until: now };
+      case "7d":
+        return { since: now - 7 * 24 * 3600, until: now };
+      case "30d":
+        return { since: now - 30 * 24 * 3600, until: now };
+      case "all":
+        return { since: 0, until: now };
+    }
   }
+  return {
+    since: typeof range.from === "number" && range.from > 0 ? range.from : 0,
+    until: typeof range.to === "number" && range.to > 0 ? range.to : now,
+  };
 }
 
 export interface Totals {
@@ -159,8 +179,8 @@ export interface Breakdown extends Totals {
   key: string;
 }
 
-export function totals(period: Period): Totals {
-  const since = sinceFor(period);
+export function totals(range: Range): Totals {
+  const { since, until } = resolveRange(range);
   const row = db
     .prepare(
       `SELECT
@@ -169,14 +189,14 @@ export function totals(period: Period): Totals {
          COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
          COALESCE(SUM(total_tokens), 0)      AS total_tokens,
          COALESCE(SUM(cost_usd), 0)          AS cost_usd
-       FROM calls WHERE ts >= ?`,
+       FROM calls WHERE ts >= ? AND ts <= ?`,
     )
-    .get(since) as Totals;
+    .get(since, until) as Totals;
   return row;
 }
 
-function breakdownBy(column: string, period: Period): Breakdown[] {
-  const since = sinceFor(period);
+function breakdownBy(column: string, range: Range): Breakdown[] {
+  const { since, until } = resolveRange(range);
   const rows = db
     .prepare(
       `SELECT
@@ -187,22 +207,22 @@ function breakdownBy(column: string, period: Period): Breakdown[] {
          COALESCE(SUM(total_tokens), 0)      AS total_tokens,
          COALESCE(SUM(cost_usd), 0)          AS cost_usd
        FROM calls
-       WHERE ts >= ?
+       WHERE ts >= ? AND ts <= ?
        GROUP BY key
        ORDER BY cost_usd DESC, calls DESC`,
     )
-    .all(since) as Breakdown[];
+    .all(since, until) as Breakdown[];
   return rows;
 }
 
-export function byModel(period: Period) {
-  return breakdownBy("routed_model", period);
+export function byModel(range: Range) {
+  return breakdownBy("routed_model", range);
 }
-export function byProject(period: Period) {
-  return breakdownBy("project", period);
+export function byProject(range: Range) {
+  return breakdownBy("project", range);
 }
-export function byWorkType(period: Period) {
-  return breakdownBy("work_type", period);
+export function byWorkType(range: Range) {
+  return breakdownBy("work_type", range);
 }
 
 export interface RecentCall {
@@ -229,13 +249,13 @@ export interface RecentCall {
   quality_judged_at: number | null;
 }
 
-export function recent(period: Period, limit = 100): RecentCall[] {
-  const since = sinceFor(period);
+export function recent(range: Range, limit = 100): RecentCall[] {
+  const { since, until } = resolveRange(range);
   return db
     .prepare(
-      `SELECT * FROM calls WHERE ts >= ? ORDER BY ts DESC LIMIT ?`,
+      `SELECT * FROM calls WHERE ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT ?`,
     )
-    .all(since, limit) as RecentCall[];
+    .all(since, until, limit) as RecentCall[];
 }
 
 /**
@@ -244,21 +264,21 @@ export function recent(period: Period, limit = 100): RecentCall[] {
  * whether to upgrade the heuristic or add a keyword pattern.
  */
 export function recentLowQuality(
-  period: Period,
+  range: Range,
   threshold = 6,
   limit = 50,
 ): RecentCall[] {
-  const since = sinceFor(period);
+  const { since, until } = resolveRange(range);
   return db
     .prepare(
       `SELECT * FROM calls
-       WHERE ts >= ?
+       WHERE ts >= ? AND ts <= ?
          AND quality_score IS NOT NULL
          AND quality_score < ?
        ORDER BY quality_score ASC, ts DESC
        LIMIT ?`,
     )
-    .all(since, threshold, limit) as RecentCall[];
+    .all(since, until, threshold, limit) as RecentCall[];
 }
 
 export interface QualitySummary {
@@ -267,8 +287,8 @@ export interface QualitySummary {
   flagged_for_sonnet: number;
 }
 
-export function qualitySummary(period: Period): QualitySummary {
-  const since = sinceFor(period);
+export function qualitySummary(range: Range): QualitySummary {
+  const { since, until } = resolveRange(range);
   const row = db
     .prepare(
       `SELECT
@@ -276,9 +296,9 @@ export function qualitySummary(period: Period): QualitySummary {
          AVG(quality_score) AS avg_score,
          SUM(quality_better_with_sonnet) AS flagged_for_sonnet
        FROM calls
-       WHERE ts >= ? AND quality_score IS NOT NULL`,
+       WHERE ts >= ? AND ts <= ? AND quality_score IS NOT NULL`,
     )
-    .get(since) as {
+    .get(since, until) as {
     judged_calls: number;
     avg_score: number | null;
     flagged_for_sonnet: number | null;

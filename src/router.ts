@@ -29,7 +29,7 @@
  * Fireworks; everything else goes to OpenRouter.
  */
 
-import { detectProvider, type Provider } from "./providers.js";
+import { detectProvider, useDirectAnthropic, type Provider } from "./providers.js";
 
 export type Tier = "cheap" | "agentic" | "code" | "reasoning";
 
@@ -38,15 +38,49 @@ export interface TierEntry {
   model: string;
 }
 
-export const MODELS: Record<Tier, TierEntry> = {
-  cheap: {
-    provider: "fireworks",
-    model: "accounts/fireworks/models/deepseek-v4-pro",
-  },
-  agentic: { provider: "openrouter", model: "xiaomi/mimo-v2.5-pro" },
-  code: { provider: "openrouter", model: "anthropic/claude-sonnet-4.6" },
-  reasoning: { provider: "openrouter", model: "anthropic/claude-opus-4.7" },
-};
+/**
+ * Tier -> (provider, model) mapping.
+ *
+ * `code` and `reasoning` flip between OpenRouter and direct-Anthropic
+ * based on `ROUTER_USE_DIRECT_ANTHROPIC`. The OpenRouter path supports
+ * Anthropic prompt caching via cache_control markers (see prompt-cache.ts);
+ * the direct path is faster first-token but doesn't cache.
+ *
+ * Override either model by env:
+ *   ROUTER_MODEL_CODE        e.g. "anthropic/claude-sonnet-4.6" or "claude-sonnet-4-6"
+ *   ROUTER_MODEL_REASONING   e.g. "anthropic/claude-opus-4.7"   or "claude-opus-4-7"
+ */
+function buildModels(): Record<Tier, TierEntry> {
+  const direct = useDirectAnthropic();
+  const codeModel =
+    process.env.ROUTER_MODEL_CODE ??
+    (direct ? "claude-sonnet-4-6" : "anthropic/claude-sonnet-4.6");
+  const reasoningModel =
+    process.env.ROUTER_MODEL_REASONING ??
+    (direct ? "claude-opus-4-7" : "anthropic/claude-opus-4.7");
+  return {
+    cheap: {
+      provider: "fireworks",
+      model:
+        process.env.ROUTER_MODEL_CHEAP ??
+        "accounts/fireworks/models/deepseek-v4-pro",
+    },
+    agentic: {
+      provider: "openrouter",
+      model: process.env.ROUTER_MODEL_AGENTIC ?? "xiaomi/mimo-v2.5-pro",
+    },
+    code: {
+      provider: direct ? "anthropic" : "openrouter",
+      model: codeModel,
+    },
+    reasoning: {
+      provider: direct ? "anthropic" : "openrouter",
+      model: reasoningModel,
+    },
+  };
+}
+
+export const MODELS: Record<Tier, TierEntry> = buildModels();
 
 /** Aliases the user can request directly as `model` (or as a `!alias` prefix
  *  on the last user message — see `parsePromptOverride` in classify.ts). */

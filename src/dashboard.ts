@@ -9,6 +9,7 @@ import {
   recentLowQuality,
   totals,
   type Period,
+  type Range,
 } from "./db.js";
 
 /** Constant-time-ish string compare. */
@@ -47,6 +48,31 @@ function parsePeriod(v: string | undefined): Period {
   return "7d";
 }
 
+function parseEpoch(v: string | undefined): number | undefined {
+  if (!v) return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.floor(n);
+}
+
+/**
+ * Resolve the time range from query params. Custom `from`/`to` (epoch
+ * seconds) override `period`. If only `from` is given, `to` defaults to
+ * now; if only `to` is given, `from` defaults to 0 (all of history).
+ */
+function parseRange(c: Context): { range: Range; label: string } {
+  const fromQ = parseEpoch(c.req.query("from"));
+  const toQ = parseEpoch(c.req.query("to"));
+  if (fromQ !== undefined || toQ !== undefined) {
+    return {
+      range: { from: fromQ, to: toQ },
+      label: `custom:${fromQ ?? 0}-${toQ ?? "now"}`,
+    };
+  }
+  const p = parsePeriod(c.req.query("period"));
+  return { range: p, label: p };
+}
+
 export function mountDashboard(app: Hono): void {
   app.use("/dashboard", async (c, next) => {
     if (!checkBasicAuth(c)) {
@@ -73,17 +99,17 @@ export function mountDashboard(app: Hono): void {
   });
 
   app.get("/dashboard/api/stats", (c) => {
-    const period = parsePeriod(c.req.query("period"));
+    const { range, label } = parseRange(c);
     return c.json({
-      period,
-      totals: totals(period),
-      by_model: byModel(period),
-      by_project: byProject(period),
-      by_work_type: byWorkType(period),
+      period: label,
+      totals: totals(range),
+      by_model: byModel(range),
+      by_project: byProject(range),
+      by_work_type: byWorkType(range),
       breaker: breakerSnapshot(),
-      quality: qualitySummary(period),
-      low_quality: recentLowQuality(period, 6, 50),
-      recent: recent(period, 100),
+      quality: qualitySummary(range),
+      low_quality: recentLowQuality(range, 6, 50),
+      recent: recent(range, 100),
       generated_at: Math.floor(Date.now() / 1000),
     });
   });
@@ -133,6 +159,29 @@ const DASHBOARD_HTML = `<!doctype html>
   }
   .seg button.active { background: var(--panel-2); color: var(--text); }
   .seg button + button { border-left: 1px solid var(--border); }
+  .range-picker {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border: 1px solid var(--border); border-radius: 8px;
+    color: var(--muted); font-size: 12px;
+  }
+  .range-picker input[type="date"] {
+    background: transparent; border: 0; color: var(--text);
+    font: inherit; padding: 2px 4px; outline: none;
+    color-scheme: dark;
+  }
+  .range-picker input[type="date"]::-webkit-calendar-picker-indicator {
+    filter: invert(1) opacity(0.5); cursor: pointer;
+  }
+  .range-picker button.apply {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 3px 8px; font: inherit; cursor: pointer; font-size: 11px;
+  }
+  .range-picker button.apply:hover { background: var(--border); }
+  .range-picker button.clear {
+    background: transparent; border: 0; color: var(--muted);
+    cursor: pointer; padding: 2px 4px; font-size: 14px; line-height: 1;
+  }
+  .range-picker.active { color: var(--text); border-color: var(--accent); }
   main { padding: 24px; max-width: 1200px; margin: 0 auto; }
   .grid { display: grid; gap: 16px; }
   .grid-4 { grid-template-columns: repeat(4, 1fr); }
@@ -193,10 +242,18 @@ const DASHBOARD_HTML = `<!doctype html>
   <span class="muted mono" id="updated"></span>
   <div class="spacer"></div>
   <div class="seg" id="period-seg">
+    <button data-p="today">today</button>
     <button data-p="24h">24h</button>
     <button data-p="7d" class="active">7d</button>
     <button data-p="30d">30d</button>
     <button data-p="all">all</button>
+  </div>
+  <div class="range-picker" id="range-picker">
+    <input type="date" id="range-from" aria-label="from">
+    <span>→</span>
+    <input type="date" id="range-to" aria-label="to">
+    <button class="apply" id="range-apply">apply</button>
+    <button class="clear" id="range-clear" title="clear custom range" style="display:none">×</button>
   </div>
 </header>
 <main>
@@ -234,6 +291,30 @@ const DASHBOARD_HTML = `<!doctype html>
 <script>
   const $ = (id) => document.getElementById(id);
   let period = "7d";
+  // When set, a custom date range overrides the period preset. Either
+  // bound may be null (open-ended). Stored as YYYY-MM-DD strings to
+  // match the date-input values.
+  let customRange = null;
+
+  function dateToEpoch(s, endOfDay) {
+    if (!s) return null;
+    const [y, m, d] = s.split("-").map(Number);
+    if (!y || !m || !d) return null;
+    const dt = new Date(y, m - 1, d, endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0);
+    return Math.floor(dt.getTime() / 1000);
+  }
+
+  function statsUrl() {
+    if (customRange && (customRange.from || customRange.to)) {
+      const params = new URLSearchParams();
+      const from = dateToEpoch(customRange.from, false);
+      const to = dateToEpoch(customRange.to, true);
+      if (from != null) params.set("from", String(from));
+      if (to != null) params.set("to", String(to));
+      return "/dashboard/api/stats?" + params.toString();
+    }
+    return "/dashboard/api/stats?period=" + period;
+  }
 
   function fmtMoney(n) {
     if (!n) return "$0";
@@ -349,7 +430,7 @@ const DASHBOARD_HTML = `<!doctype html>
   }
 
   async function load() {
-    const res = await fetch("/dashboard/api/stats?period=" + period, { credentials: "include" });
+    const res = await fetch(statsUrl(), { credentials: "include" });
     if (!res.ok) {
       document.body.innerHTML = "<p style='padding:24px'>Failed to load stats: " + res.status + "</p>";
       return;
@@ -409,17 +490,77 @@ const DASHBOARD_HTML = `<!doctype html>
     }
   }
 
-  document.querySelectorAll("#period-seg button").forEach(b => {
-    b.addEventListener("click", () => {
-      document.querySelectorAll("#period-seg button").forEach(x => x.classList.remove("active"));
-      b.classList.add("active");
-      period = b.dataset.p;
-      load();
+  // "today" is implemented client-side as midnight-to-now in the user's
+  // local timezone, so it respects DST and locale. The other presets
+  // (24h, 7d, 30d, all) are server-side rolling windows.
+  function applyPreset(preset) {
+    document.querySelectorAll("#period-seg button").forEach(x => x.classList.remove("active"));
+    document.querySelectorAll("#period-seg button").forEach(x => {
+      if (x.dataset.p === preset) x.classList.add("active");
     });
+    if (preset === "today") {
+      const now = new Date();
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      // Use a custom range under the hood so we hit the from/to query params.
+      period = "today";
+      customRange = {
+        from: start.toISOString().slice(0, 10),
+        to: now.toISOString().slice(0, 10),
+      };
+      $("range-from").value = customRange.from;
+      $("range-to").value = customRange.to;
+      $("range-picker").classList.remove("active"); // visually still belongs to preset
+      $("range-clear").style.display = "none";
+    } else {
+      period = preset;
+      customRange = null;
+      $("range-from").value = "";
+      $("range-to").value = "";
+      $("range-picker").classList.remove("active");
+      $("range-clear").style.display = "none";
+    }
+    load();
+  }
+
+  document.querySelectorAll("#period-seg button").forEach(b => {
+    b.addEventListener("click", () => applyPreset(b.dataset.p));
+  });
+
+  function applyCustomRange() {
+    const from = $("range-from").value || null;
+    const to = $("range-to").value || null;
+    if (!from && !to) {
+      customRange = null;
+      $("range-picker").classList.remove("active");
+      $("range-clear").style.display = "none";
+    } else {
+      customRange = { from, to };
+      $("range-picker").classList.add("active");
+      $("range-clear").style.display = "";
+      // Deselect period buttons since custom range overrides them.
+      document.querySelectorAll("#period-seg button").forEach(x => x.classList.remove("active"));
+    }
+    load();
+  }
+
+  $("range-apply").addEventListener("click", applyCustomRange);
+  $("range-from").addEventListener("change", () => { /* don't auto-apply, wait for Apply click */ });
+  $("range-to").addEventListener("change", () => { /* same */ });
+  // Allow Enter in either date input to apply.
+  ["range-from", "range-to"].forEach(id => {
+    $(id).addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") applyCustomRange();
+    });
+  });
+  $("range-clear").addEventListener("click", () => {
+    // Clearing a custom range falls back to 7d (the default preset).
+    applyPreset("7d");
   });
 
   load();
-  setInterval(load, 15_000);
+  // Slow down auto-refresh while a custom range is active — the range is
+  // user-chosen, no need to refresh as aggressively.
+  setInterval(() => { if (!document.hidden) load(); }, 15_000);
 </script>
 </body>
 </html>`;

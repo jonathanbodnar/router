@@ -74,32 +74,156 @@ export function detectProject(req: IncomingRequest): string | null {
 
 export type WorkType = "bug_fix" | "rework" | "new_feature" | "other";
 
-const BUG_FIX_RE =
-  /\b(fix(?:es|ed|ing)?|bug|broken|crash(?:es|ed|ing)?|regression|hotfix|patch|stack ?trace|traceback|error message|throws?\b|failing test|failure|repro|root cause)\b/i;
-
-const REWORK_RE =
-  /\b(refactor(?:ing|ed)?|rework(?:ing|ed)?|rewrite|rewriting|restructur(?:e|ing)|cleanup|clean up|tidy up|migrate|migration|simplify|deduplicate|extract (?:method|function|component)|rename)\b/i;
-
-const NEW_FEATURE_RE =
-  /\b(add(?:ing)?|implement(?:ing|ed)?|build(?:ing)?|create(?:s|d|ing)?|introduce(?:s|d)?|new (?:feature|endpoint|component|module|product|page|screen|workflow|api|tool|script)|set up|setup|scaffold|bootstrap|prototype|MVP)\b/i;
-
-/** Concatenate the last few user messages — that's where the actual ask is. */
-function recentUserText(req: IncomingRequest, n = 3): string {
-  const userMsgs = (req.messages ?? []).filter((m) => m.role === "user");
-  return userMsgs.slice(-n).map(messageText).join("\n");
+/**
+ * Strip the Cursor user-message wrapper so the regexes don't see the
+ * <timestamp> / <user_query> tags that surround every message. Without
+ * this, half of all messages match BUG_FIX_RE just because the wrapper
+ * happens to contain "Tuesday" or similar accidental matches.
+ */
+function unwrapUserText(s: string): string {
+  return s
+    .replace(/<timestamp>[\s\S]*?<\/timestamp>/gi, "")
+    .replace(/<\/?user_query>/gi, "")
+    .replace(/<\/?attached_files>[\s\S]*?<\/attached_files>/gi, "")
+    .replace(/<\/?system_reminder>[\s\S]*?<\/system_reminder>/gi, "")
+    .trim();
 }
 
+/**
+ * Bug fix signals — must be reasonably specific to actual bugs, NOT just
+ * the word "fix". Plain "fix the typo" or "fix the comment" doesn't count
+ * as a real bug fix and should fall through to "other".
+ */
+const BUG_FIX_RE = new RegExp(
+  [
+    // Explicit bug language
+    "\\bbug\\b",
+    "\\bbugs\\b",
+    "\\bhotfix\\b",
+    "\\bregression\\b",
+    "\\broot ?cause\\b",
+    "\\brepro(?:duce|duction)?\\b",
+    // "X is broken / not working / failing" etc.
+    "\\b(?:is|isn'?t|wasn'?t|aren'?t|are|been|been not) (?:broken|crashing|throwing|failing|erroring|hanging|stuck|stalling|stalled|deadlocked|undefined)\\b",
+    "\\b(?:doesn'?t|does not|won'?t|will not) (?:work|render|load|compile|build|return|fire|trigger|respond|update|persist)\\b",
+    "\\b(?:not|never) (?:working|rendering|loading|firing|persisting|returning|saving)\\b",
+    // Errors / crashes / traces
+    "\\b(?:throws?|threw|throwing) (?:an? )?(?:error|exception|TypeError|ReferenceError|RangeError|null|undefined)\\b",
+    "\\b(?:stack ?trace|traceback|null pointer|segfault|panic|core dumped)\\b",
+    "\\b(?:crash(?:es|ed|ing)?|panicking)\\b",
+    "\\bfailing tests?\\b",
+    "\\btests? (?:failing|are failing|fails?|breaks?|broken)\\b",
+    // "fix the X" where X is bug-language adjacent
+    "\\bfix (?:the |this |that |a |an |my |our )?(?:bug|crash|error|exception|panic|regression|hang|deadlock|race|memory leak|leak|null pointer|segfault|stall|broken)\\b",
+    // Diagnostic verbs (when paired with errors/bugs)
+    "\\bdebug (?:the |this |a )?(?:bug|error|crash|issue|problem|failure)\\b",
+    "\\bwhy (?:is|isn'?t|does|doesn'?t|are|aren'?t).{0,40}(?:broken|failing|crashing|throwing|undefined|null)",
+  ].join("|"),
+  "i",
+);
+
+/**
+ * Feature-noun group — used by both REWORK_RE (extract a hook) and
+ * NEW_FEATURE_RE (build a hook). Kept in one place so adding a new noun
+ * affects both classifiers consistently.
+ */
+const FEATURE_NOUN =
+  "feature|endpoint|api|route|page|screen|view|component|module|service|hook|workflow|integration|provider|adapter|migration|table|schema|model|dashboard|panel|widget|form|button|modal|chart|graph|report|tool|script|cli|webhook|listener|handler|consumer|publisher|cron|job|worker|microservice|database|index|cache|queue|product|payment|auth|login|signup|onboarding|notification|alert|email|sms|push|mvp|prototype|poc|demo";
+
+/**
+ * Rework signals — refactors, migrations, renames, restructuring.
+ *
+ * Matches allow up to three filler words between the verb and the noun
+ * so phrasings like "simplify the public api" and "rename utils.ts to
+ * helpers.ts" still match.
+ */
+const REWORK_RE = new RegExp(
+  [
+    "\\brefactor(?:s|ed|ing)?\\b",
+    "\\brework(?:s|ed|ing)?\\b",
+    "\\brewrit(?:e|es|ing|ten)\\b",
+    "\\brestructur(?:e|es|ed|ing)\\b",
+    "\\bclean ?up (?:the |this |these )?(?:code|file|files|module|component|implementation|logic)",
+    "\\btidy ?up\\b",
+    "\\bmigrat(?:e|ion|ing|ed) (?:from|to|away|the)\\b",
+    "\\bsimplify (?:[\\w/.-]+ ){0,3}(?:code|implementation|logic|api|interface|module)\\b",
+    "\\bdedup(?:e|licate|licates|licating)\\b",
+    "\\bextract (?:a |the |this |that )?(?:method|function|component|hook|module|helper|util|interface|type)\\b",
+    "\\bconsolidate\\b",
+    "\\b(?:rename|renaming) (?:the |this |a |an |my |our )?(?:file|function|class|component|method|type|interface|module|directory|folder|column|table|field)\\b",
+    // "rename utils.ts to helpers.ts" — file/symbol-style renames with → arrow
+    "\\b(?:rename|renaming) [\\w./-]+ (?:to|->|→) [\\w./-]+",
+    "\\bsplit (?:up |out )?(?:the |this )?(?:file|function|component|module) (?:into|across|up)\\b",
+    "\\bmerge (?:the |these )?(?:files|functions|components|modules) (?:into|together)\\b",
+    "\\bport (?:the |this |our )?[\\w-]+ (?:to|from)\\b",
+  ].join("|"),
+  "i",
+);
+
+/**
+ * New-feature signals — building genuinely new things.
+ *
+ * Matches a feature verb followed by up to three filler words and then a
+ * concrete feature noun. This keeps "build a small CLI tool" and "create
+ * a new payment endpoint" working without tripping on bare "add" or "create".
+ */
+const NEW_FEATURE_RE = new RegExp(
+  [
+    `\\b(?:build|create|implement|add|introduce|wire (?:up|in)|scaffold|bootstrap|spin up|stand up|set up|setup|design) (?:[\\w-]+ ){0,4}(?:${FEATURE_NOUN})s?\\b`,
+    "\\b(?:from scratch|greenfield)\\b",
+    `\\b(?:a |the )?new (?:[\\w-]+ ){0,2}(?:${FEATURE_NOUN})s?\\b`,
+    "\\bstart(?:ing)? (?:on |working on |building |implementing )(?:a |the |new )?",
+    "\\b(?:MVP|prototype)\\b",
+  ].join("|"),
+  "i",
+);
+
+/**
+ * Anti-patterns: matches that LOOK like new-feature/bug language but are
+ * actually trivial maintenance. If any of these match, downgrade to
+ * "other" before the main classifier runs.
+ */
+const TRIVIAL_RE = new RegExp(
+  [
+    "\\b(?:add|update|fix|remove|delete) (?:a |the |an |this )?(?:comment|comments|typo|typos|whitespace|indent|indentation|newline|trailing|spacing|formatting|format|prettier|lint|eslint)\\b",
+    "\\b(?:add|update|fix|remove|delete) (?:a |the |an |this )?(?:import|imports|export|exports)\\b",
+    "\\b(?:rename) (?:a |the |this )?(?:variable|var|const|let|param|parameter)\\b",
+  ].join("|"),
+  "i",
+);
+
+/**
+ * Examine the user's latest message (only) to classify the work type.
+ * Earlier turns are noisy in agent loops — they often mention "fix" and
+ * "implement" from previous tasks even though the current ask is
+ * unrelated. We pin to the latest message and strip Cursor's wrapper.
+ *
+ * Override via the X-Router-Work-Type header (handled in resolveWorkType).
+ */
 export function detectWorkType(req: IncomingRequest): WorkType {
-  const text = recentUserText(req);
-  if (!text) return "other";
+  // Latest user message only.
+  let text = "";
+  const msgs = req.messages ?? [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.role === "user") {
+      text = unwrapUserText(messageText(msgs[i]!));
+      break;
+    }
+  }
+  if (!text || text.length < 4) return "other";
+
+  // If it's clearly a trivial maintenance task, return "other" up front
+  // so the verb regexes can't fire false positives like "add a comment"
+  // -> new_feature.
+  if (TRIVIAL_RE.test(text)) return "other";
 
   const bug = BUG_FIX_RE.test(text);
   const rew = REWORK_RE.test(text);
   const neu = NEW_FEATURE_RE.test(text);
 
-  // Disambiguation: if multiple match, prefer the most "specific" signal.
-  // bug_fix wins over rework wins over new_feature, because the verbs in
-  // new_feature ("add", "create") are easy false positives.
+  // Disambiguation: when multiple match, the most specific signal wins.
+  // Bug-fix language is the rarest false positive, then rework, then new
+  // feature (whose verbs are still the easiest to overshoot on).
   if (bug) return "bug_fix";
   if (rew) return "rework";
   if (neu) return "new_feature";

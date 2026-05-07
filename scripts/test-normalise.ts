@@ -325,7 +325,10 @@ console.log("\n=== normaliseBody: Cursor-shaped Responses API request ===\n");
 
   expect("input field removed", body.input === undefined);
   expect("store field removed", body.store === undefined);
-  expect("metadata preserved", body.metadata !== undefined);
+  expect(
+    "metadata stripped (causes gpt-4.1__shoutout stall on strict upstreams)",
+    body.metadata === undefined,
+  );
   expect(
     "tools nested",
     (body.tools as any[])[0].function?.name === "Shell",
@@ -349,6 +352,104 @@ console.log("\n=== normaliseBody: Cursor-shaped Responses API request ===\n");
   );
   expect("response_format set", (body as any).response_format?.type === "json_schema");
   expect("text field removed", body.text === undefined);
+}
+
+console.log("\n=== normaliseBody: image content (vision support) ===\n");
+
+{
+  // Cursor-style input_image part with a data URL.
+  const before = {
+    model: "auto",
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "what's in this screenshot?" },
+          {
+            type: "input_image",
+            image_url: "data:image/png;base64,iVBORw0KGgoAAAANSU=",
+          },
+        ],
+      },
+    ],
+  };
+  const { body } = normaliseBody(before);
+  const msgs = body.messages as any[];
+  expect("image-bearing message preserved", msgs.length === 1);
+  expect("content is structured array (not flattened)", Array.isArray(msgs[0].content));
+  const parts = msgs[0].content as any[];
+  expect("text part preserved", parts[0]?.type === "text" && parts[0]?.text === "what's in this screenshot?");
+  expect(
+    "image normalised to OpenAI image_url shape",
+    parts[1]?.type === "image_url" &&
+      parts[1]?.image_url?.url === "data:image/png;base64,iVBORw0KGgoAAAANSU=",
+    `got ${JSON.stringify(parts[1])}`,
+  );
+}
+
+{
+  // OpenAI-style image_url part with object shape and detail.
+  const before = {
+    model: "auto",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "describe" },
+          {
+            type: "image_url",
+            image_url: { url: "https://example.com/x.png", detail: "high" },
+          },
+        ],
+      },
+    ],
+  };
+  const { body } = normaliseBody(before);
+  const parts = (body.messages as any[])[0].content as any[];
+  expect(
+    "OpenAI image_url passes through with detail",
+    parts[1]?.type === "image_url" &&
+      parts[1]?.image_url?.url === "https://example.com/x.png" &&
+      parts[1]?.image_url?.detail === "high",
+  );
+}
+
+{
+  // Anthropic-style image source -> rewritten as OpenAI image_url.
+  const before = {
+    model: "auto",
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "look" },
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/jpeg", data: "AAAA" },
+          },
+        ],
+      },
+    ],
+  };
+  const { body } = normaliseBody(before);
+  const parts = (body.messages as any[])[0].content as any[];
+  expect(
+    "Anthropic image source -> data URL",
+    parts[1]?.type === "image_url" &&
+      parts[1]?.image_url?.url === "data:image/jpeg;base64,AAAA",
+  );
+}
+
+{
+  // Pure text in a typed-parts array still flattens to a string for
+  // backwards compat with classifier code that assumes string content.
+  const before = {
+    model: "auto",
+    input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+  };
+  const { body } = normaliseBody(before);
+  const c = (body.messages as any[])[0].content;
+  expect("text-only content stays a string", typeof c === "string" && c === "hi");
 }
 
 if (failed > 0) {
