@@ -154,7 +154,10 @@ export function resolveProject(
  *   - return a NEW request with the modified message and `model` set
  *     to the alias so `route()` will resolve it.
  *
- * Recognised forms (case-insensitive, must be at the very start):
+ * Recognised forms (case-insensitive). The tag may appear at the very start
+ * of the message, OR at the start of any line — this is important because
+ * Cursor wraps user messages with `<timestamp>...</timestamp>\n<user_query>\n`
+ * before the actual prompt, so `[sonnet]` ends up on a line by itself.
  *
  *   !alias    rest...
  *   [alias]   rest...
@@ -163,7 +166,7 @@ export function resolveProject(
  * `!unknownword foo` is left untouched so we don't accidentally eat a
  * legitimate `!important` style at the start of a message.
  */
-const PROMPT_TAG_RE = /^[ \t]*(?:!([a-z][a-z0-9_-]*)|\[([a-z][a-z0-9_-]*)\])(?=[\s,:.\-]|$)([\s\S]*)$/i;
+const PROMPT_TAG_RE = /(?:^|\n)[ \t]*(?:!([a-z][a-z0-9_-]*)|\[([a-z][a-z0-9_-]*)\])(?=[\s,:.\-]|$)/i;
 
 export interface PromptOverride {
   alias: string;
@@ -210,9 +213,13 @@ export function parsePromptOverride(req: IncomingRequest): PromptOverride | null
   const alias = (m[1] ?? m[2] ?? "").toLowerCase();
   if (!alias || !(alias in ALIASES)) return null;
 
-  // Strip the matched tag and any single delimiter (`:` `,` `-` `–` or
-  // whitespace) immediately after it. We keep the rest verbatim.
-  const rest = (m[3] ?? "").replace(/^[\s,:.\-–—]+/, "");
+  // Strip the matched tag (just the tag itself, leaving the wrapper context
+  // and following text intact) plus any trailing delimiter right after it.
+  const tagStart = m.index + (m[0].startsWith("\n") ? 1 : 0);
+  const tagEnd = m.index + m[0].length;
+  const before = text.slice(0, tagStart);
+  const after = text.slice(tagEnd).replace(/^[ \t]*[\s,:.\-–—]+/, "");
+  const rest = before + after;
 
   const newMessages = messages.slice();
   newMessages[lastUserIdx] = setMessageContent(msg, rest);

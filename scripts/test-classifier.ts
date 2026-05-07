@@ -62,6 +62,36 @@ console.log("\n=== parsePromptOverride ===\n");
 }
 
 {
+  // Cursor wraps user messages with <timestamp>...</timestamp>\n<user_query>\n
+  // before the actual prompt. The override must still match.
+  const wrapped =
+    "<timestamp>Tuesday, May 5, 2026, 3:16 PM (UTC-5)</timestamp>\n" +
+    "<user_query>\n[sonnet] Okay on create payment link, fix the bug\n</user_query>";
+  const r = parsePromptOverride({
+    model: "auto",
+    messages: [{ role: "user", content: wrapped }],
+  });
+  expect("[sonnet] inside Cursor wrapper detected", r?.alias === "sonnet", `alias=${r?.alias}`);
+  expect("model overridden to sonnet", r?.request.model === "sonnet");
+  const c = r?.request.messages?.[0]?.content;
+  expect(
+    "tag stripped, wrapper preserved",
+    typeof c === "string" && c.includes("Okay on create payment link") && !c.includes("[sonnet]"),
+    `content=${JSON.stringify(c)}`,
+  );
+}
+
+{
+  // Same wrapping but with !sonnet bang form
+  const wrapped =
+    "<timestamp>x</timestamp>\n<user_query>\n!opus refactor billing flow\n</user_query>";
+  const r = parsePromptOverride({
+    messages: [{ role: "user", content: wrapped }],
+  });
+  expect("!opus inside wrapper detected", r?.alias === "opus");
+}
+
+{
   const r = parsePromptOverride({
     messages: [
       { role: "system", content: "ignore this" },

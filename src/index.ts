@@ -790,9 +790,10 @@ app.post("/v1/chat/completions", async (c) => {
     };
 
     // If the upstream model connects but produces no real content for this
-    // many ms, abort it and retry with Sonnet directly. Prevents MiMo queue
-    // back-pressure from causing 60-80s hangs that kill Cursor's subagents.
-    const FIRST_CONTENT_TIMEOUT_MS = 25_000;
+    // many ms, abort it and retry with Sonnet directly. MiMo's median
+    // first-content time is 10-15s; the slow tail (>18s) often runs to
+    // 60-80s when OpenRouter is queue-backlogged, killing Cursor subagents.
+    const FIRST_CONTENT_TIMEOUT_MS = 18_000;
 
     // Detached async function that fetches upstream and pipes
     // chunks into the controller. Runs independently of start().
