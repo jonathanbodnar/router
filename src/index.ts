@@ -580,17 +580,6 @@ app.post("/v1/chat/completions", async (c) => {
       }
       breaker.record(cand.model, resp.ok);
 
-      let bodyPreview = "";
-      if (process.env.ROUTER_LOG_UPSTREAM === "1") {
-        try {
-          bodyPreview = (await resp.clone().text()).slice(0, 2000);
-          console.log(
-            `[upstream-in] ${cand.providerCfg.name}:${cand.model} ` +
-              `status=${resp.status} body=${bodyPreview}`,
-          );
-        } catch { /* ignore */ }
-      }
-
       // Update "what we actually called" so logs / DB / response metadata
       // reflect reality.
       actualProvider = cand.providerCfg;
@@ -600,12 +589,36 @@ app.post("/v1/chat/completions", async (c) => {
         fellBackTo = `${cand.providerCfg.name}:${cand.model} (${cand.label})`;
       }
 
-      if (resp.ok) return resp;
+      // Successful response: return IMMEDIATELY so the streaming pipeline
+      // can start piping bytes to the client. Critically, we do NOT await
+      // resp.clone().text() here — for SSE responses that call blocks
+      // until the entire stream completes (often minutes), causing the
+      // exact stall the heartbeat machinery exists to prevent. If verbose
+      // upstream logging is on, fire-and-forget the body preview on the
+      // clone so it never gates the hot path.
+      if (resp.ok) {
+        if (process.env.ROUTER_LOG_UPSTREAM === "1") {
+          resp.clone().text().then(
+            (txt) => console.log(
+              `[upstream-in] ${cand.providerCfg.name}:${cand.model} ` +
+                `status=${resp.status} body=${txt.slice(0, 2000)}`,
+            ),
+            () => {},
+          );
+        }
+        return resp;
+      }
 
-      // Non-OK: snapshot body, log a one-liner, continue walking.
-      let bodyText = bodyPreview;
-      if (!bodyText) {
-        try { bodyText = (await resp.clone().text()).slice(0, 2000); } catch { /* ignore */ }
+      // Non-OK: read the body synchronously — error responses are tiny
+      // (a JSON error doc) so this never blocks meaningfully, and we need
+      // the body to decide whether to continue walking the fallback chain.
+      let bodyText = "";
+      try { bodyText = (await resp.clone().text()).slice(0, 2000); } catch { /* ignore */ }
+      if (process.env.ROUTER_LOG_UPSTREAM === "1") {
+        console.log(
+          `[upstream-in] ${cand.providerCfg.name}:${cand.model} ` +
+            `status=${resp.status} body=${bodyText}`,
+        );
       }
       console.warn(
         `[fallback] ${cand.providerCfg.name}:${cand.model} (${cand.label}) -> ` +
@@ -1014,6 +1027,11 @@ app.post("/v1/chat/completions", async (c) => {
         if (log) console.log(`[heartbeat] stream opened for ${actualModel}, firing first HB immediately`);
         emitHeartbeat();
         heartbeatTimer = setInterval(emitHeartbeat, HEARTBEAT_MS);
+        // Arm the hard ceiling SYNCHRONOUSLY — not from inside pipeUpstream
+        // — so even if the upstream HTTP fetch itself hangs forever (no
+        // headers, no body), the timer will still fire and close the
+        // stream. Inside pipeUpstream the call is a no-op (re-arm guard).
+        armHardTimeout();
         pipeUpstream();
       },
       cancel(reason) {
